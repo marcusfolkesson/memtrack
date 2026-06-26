@@ -79,6 +79,7 @@ static __thread char   thread_name[16] = {};   // cached on first use; max 15 ch
 
 static const char* get_thread_name();  // forward declaration
 static void print_frames(void**, int); // forward declaration
+static void log_free(void*, const char*); // forward declaration
 
 // ---------------------------------------------------------------------------
 // Output fd and size filter  (MEMTRACK_OUTPUT / MEMTRACK_MIN_SIZE env vars)
@@ -289,6 +290,48 @@ static void log_alloc(const char* op, size_t size, void* ptr)
         print_frames(frames, frame_count);
 }
 
+// Log a free/delete.  Only logs if the pointer is tracked in g_map (meaning
+// the allocation passed the size filter); untracked pointers are silently ignored.
+static void log_free(void* ptr, const char* op)
+{
+    if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
+
+    // Capture stack trace before touching the map.
+    void* frames[32];
+    int   frame_count = 0;
+    if (g_stack_depth > 0) {
+        const int skip  = 2;
+        const int total = g_stack_depth + skip;
+        int raw = backtrace(frames, total < 32 ? total : 32);
+        frame_count = (raw > skip) ? raw - skip : 0;
+        for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
+    }
+
+    // Look up the allocation size.  If the pointer is not in the map it was
+    // either filtered out at allocation time or allocated before memtrack loaded.
+    size_t size    = 0;
+    bool   tracked = false;
+    in_hook = true;
+    pthread_mutex_lock(&g_lock);
+    if (g_map) {
+        auto it = g_map->find(ptr);
+        if (it != g_map->end()) { size = it->second.size; tracked = true; }
+    }
+    pthread_mutex_unlock(&g_lock);
+    in_hook = false;
+
+    if (!tracked) return;
+
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+                     "[memtrack] tid=%-6d (%-15s) %-10s size=%-12zu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op, size, ptr);
+    if (n > 0) write(g_outfd, buf, (size_t)n);
+
+    if (frame_count > 0)
+        print_frames(frames, frame_count);
+}
+
 // ---------------------------------------------------------------------------
 // C API overrides
 // ---------------------------------------------------------------------------
@@ -340,7 +383,7 @@ void free(void* ptr)
 {
     if (!ptr || is_bootstrap_ptr(ptr)) return;
     if (!real_free) resolve();
-    // map_remove is a no-op when in_hook==true, so internal frees are safe.
+    log_free(ptr, "free");
     map_remove(ptr);
     real_free(ptr);
 }
@@ -371,9 +414,10 @@ static void* cpp_alloc(size_t size, const char* op)
     return p;
 }
 
-static void cpp_free(void* p) noexcept
+static void cpp_free(void* p, const char* op) noexcept
 {
     if (!p || is_bootstrap_ptr(p) || !real_free) return;
+    log_free(p, op);
     // map_remove is a no-op when in_hook==true, preventing re-entry into the
     // map while we are already inside map_record/map_remove/thread_exit_handler.
     map_remove(p);
@@ -383,9 +427,9 @@ static void cpp_free(void* p) noexcept
 void* operator new  (size_t s)            { return cpp_alloc(s, "new");   }
 void* operator new[](size_t s)            { return cpp_alloc(s, "new[]"); }
 
-void  operator delete  (void* p) noexcept { cpp_free(p); }
-void  operator delete[](void* p) noexcept { cpp_free(p); }
+void  operator delete  (void* p) noexcept { cpp_free(p, "delete");    }
+void  operator delete[](void* p) noexcept { cpp_free(p, "delete[]");  }
 
 // Sized-delete overloads (C++14)
-void  operator delete  (void* p, size_t) noexcept { cpp_free(p); }
-void  operator delete[](void* p, size_t) noexcept { cpp_free(p); }
+void  operator delete  (void* p, size_t) noexcept { cpp_free(p, "delete");   }
+void  operator delete[](void* p, size_t) noexcept { cpp_free(p, "delete[]"); }
