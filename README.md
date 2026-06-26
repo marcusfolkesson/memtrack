@@ -1,0 +1,91 @@
+# memtrack
+
+An `LD_PRELOAD` library for tracking heap allocations per thread at runtime — no recompilation required.
+
+The library is partly made with Claude Sonnet 4.6.
+
+## Features
+
+- Intercepts `malloc`, `calloc`, `realloc`, `free`, `operator new`, and `operator delete`
+- Prints each allocation with its **size**, **thread ID**, and **running total** for that thread
+- On thread exit, prints the **cumulative bytes allocated** and a **leak report** listing every pointer that was never freed
+
+## Build
+
+```sh
+make
+```
+
+This produces `memtrack.so`.
+
+## Usage
+
+```sh
+LD_PRELOAD=./memtrack.so ./your_app
+```
+
+All output goes to **stderr** so it does not interfere with your application's stdout.
+
+## Output format
+
+### Per allocation
+
+```
+[memtrack] tid=<tid>   <op>       size=<bytes>      total=<bytes>      ptr=<address>
+```
+
+| Field   | Description                                      |
+|---------|--------------------------------------------------|
+| `tid`   | Linux thread ID (`gettid`)                       |
+| `op`    | Operation: `malloc`, `calloc`, `realloc`, `new`, `new[]` |
+| `size`  | Bytes requested in this call                     |
+| `total` | Cumulative bytes allocated by this thread so far |
+| `ptr`   | Returned pointer                                 |
+
+### On thread exit
+
+```
+[memtrack] tid=<tid>   EXIT       total=<bytes>   bytes allocated
+[memtrack] tid=<tid>   LEAK       <op>       size=<bytes>   ptr=<address>
+[memtrack] tid=<tid>   SUMMARY    <N> unfreed allocation(s), <bytes> bytes leaked
+```
+
+If all allocations were freed:
+
+```
+[memtrack] tid=<tid>   SUMMARY    all allocations freed
+```
+
+### Example
+
+```
+[memtrack] tid=12345  malloc     size=1024         total=1024          ptr=0x...
+[memtrack] tid=12345  realloc    size=2048         total=3072          ptr=0x...
+[memtrack] tid=12346  malloc     size=128          total=128           ptr=0x...
+[memtrack] tid=12346  EXIT       total=128         bytes allocated
+[memtrack] tid=12346  LEAK       malloc     size=128          ptr=0x...
+[memtrack] tid=12346  SUMMARY    1 unfreed allocation(s), 128 bytes leaked
+```
+
+## Test
+
+A test application is included that exercises allocations across multiple threads and deliberately leaks one allocation in thread 1:
+
+```sh
+make test
+```
+
+## Implementation notes
+
+- **Bootstrap allocator** — `dlsym()` itself calls `calloc` during startup before the real function pointers are resolved. A static 64 KB buffer handles those early allocations safely.
+- **`in_hook` flag (thread-local)** — prevents recursive hook calls and signals that a deallocation is internal (e.g. the tracking map freeing its own nodes). `map_remove` is a no-op when `in_hook` is `true`, which also prevents a deadlock that would otherwise occur when the map's internal nodes are freed while the map lock is held.
+- **`pthread_key` destructor** — `thread_exit_handler` is registered via `pthread_key_create` and fires automatically when each thread exits, even threads that were not created by your code.
+- **Global allocation map** — a `std::unordered_map<void*, AllocInfo>` protected by a mutex tracks all live user allocations across threads. The map's own nodes are allocated while `in_hook == true` and are therefore never tracked themselves.
+- **`write()` for output** — uses `write(2)` directly instead of `printf`/`fprintf` to avoid stdio buffering and potential recursive allocations.
+
+## Limitations
+
+- `posix_memalign`, `aligned_alloc`, `memalign`, and `valloc` are not intercepted.
+- Allocations made before the library constructor runs (very early runtime init) are not tracked.
+- The leak report only covers memory allocated by the exiting thread. Memory allocated by one thread and freed by another is handled correctly during normal operation, but if the allocating thread exits before the freeing thread, it will appear as a leak in the exit report.
+- Not intended for production use; the added locking overhead affects performance.
