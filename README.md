@@ -76,7 +76,72 @@ If all allocations were freed:
 [memtrack] tid=12346  (worker-1       ) SUMMARY    1 unfreed allocation(s), 128 bytes leaked
 ```
 
-## Test
+## memview – interactive log viewer
+
+`memview` is an ncurses TUI that reads a memtrack log and lets you interactively browse allocations, inspect stack traces, and find leaks.
+
+### Build
+
+```sh
+make          # builds both memtrack.so and memview
+```
+
+### Usage
+
+```sh
+# Capture a run to a log file
+MEMTRACK_OUTPUT=run.log MEMTRACK_STACK_DEPTH=8 LD_PRELOAD=./memtrack.so ./your_app
+
+# Open the viewer
+./memview run.log
+```
+
+Or pipe directly:
+
+```sh
+LD_PRELOAD=./memtrack.so ./your_app 2>&1 | tee run.log | ./memview -
+```
+
+### Layout
+
+```
+┌─ memtrack viewer  run.log  │  42 allocs  │  3 shown ─────────────────┐
+│ Filter: Leaks    │  Thread: worker-1  │  Leaks: 3  (1.5 KB)          │
+├────────────────────────────┬───────────────────────────────────────────┤
+│ St. Pointer          Op    │ Detail [↑↓ scroll]                        │
+│ [L] 0x7f4860000880  reall… │ ── Allocation ─────────────────────────── │
+│ [A] 0x55b29f0a8160  malloc │   Op     : realloc                        │
+│                            │   Ptr    : 0x7f4860000880                 │
+│                            │   Size   : 512 B                          │
+│                            │   tid    : 602060                         │
+│                            │   Thread : worker-1                       │
+│                            │                                           │
+│                            │   Stack:                                  │
+│                            │     #0  ./app(thread_fn+0x91)             │
+│                            │     #1  /usr/lib/libc.so.6                │
+│                            │                                           │
+│                            │ ── Free ───────────────────────────────── │
+│                            │   *** NOT FREED — MEMORY LEAK ***         │
+├────────────────────────────┴───────────────────────────────────────────┤
+│ Threads: main[82 KB]  worker-1[640 B total, LEAK 512 B]  worker-2[…]  │
+│ q:quit  f:filter  t:thread  Tab/←→:pane  ↑↓:nav  PgUp/Dn  Home/End  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Status column:** `[L]` = leak, `[A]` = active (unfreed), `[F]` = freed
+
+### Keys
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | Navigate allocation list (or scroll detail pane when focused) |
+| `PgUp` `PgDn` `Home` `End` | Scroll list or detail |
+| `Tab` / `←` `→` | Switch focus between list and detail pane |
+| `f` | Cycle filter: **All → Leaks → Active → Freed** |
+| `t` | Cycle thread filter |
+| `q` / `Esc` | Quit |
+
+
 
 A test application is included that exercises allocations across multiple threads and deliberately leaks one allocation in thread 1:
 
