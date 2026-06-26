@@ -31,6 +31,7 @@ All output goes to **stderr** so it does not interfere with your application's s
 | Variable            | Default | Description |
 |---------------------|---------|-------------|
 | `MEMTRACK_MIN_SIZE` | `0`     | Suppress logging and leak tracking for allocations smaller than this many bytes. The per-thread `total` counter is unaffected and always reflects all allocations. |
+| `MEMTRACK_OUTPUT`   | _(stderr)_ | Write all output to this file instead of stderr. The file is created (or truncated) at startup. If the file cannot be opened, a warning is printed to stderr and output falls back to stderr. |
 
 ## Output format
 

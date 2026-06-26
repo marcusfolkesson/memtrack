@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <stdio.h>
@@ -78,6 +79,13 @@ static __thread char   thread_name[16] = {};   // cached on first use; max 15 ch
 static const char* get_thread_name();  // forward declaration
 
 // ---------------------------------------------------------------------------
+// Output fd and size filter  (MEMTRACK_OUTPUT / MEMTRACK_MIN_SIZE env vars)
+// Defined here so thread_exit_handler (below) can reference them.
+// ---------------------------------------------------------------------------
+static int    g_outfd    = STDERR_FILENO;
+static size_t g_min_size = 0;
+
+// ---------------------------------------------------------------------------
 // Global allocation map  (ptr -> {tid, size, op})
 //
 // Tracks every live user allocation so we can report un-freed ones at exit.
@@ -135,7 +143,7 @@ static void thread_exit_handler(void*)
     n = snprintf(buf, sizeof(buf),
                  "[memtrack] tid=%-6d (%-15s) EXIT       total=%-12zu bytes allocated\n",
                  tid, get_thread_name(), thread_total);
-    if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
+    if (n > 0) write(g_outfd, buf, (size_t)n);
 
     // Set in_hook so that g_map->erase() below does not try to re-enter the map.
     in_hook = true;
@@ -153,7 +161,7 @@ static void thread_exit_handler(void*)
             n = snprintf(buf, sizeof(buf),
                          "[memtrack] tid=%-6d (%-15s) LEAK       %-10s size=%-12zu  ptr=%p\n",
                          tid, get_thread_name(), info.op, info.size, ptr);
-            if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
+            if (n > 0) write(g_outfd, buf, (size_t)n);
         }
 
         // Second pass: erase this thread's entries.
@@ -171,23 +179,30 @@ static void thread_exit_handler(void*)
                          "[memtrack] tid=%-6d (%-15s) SUMMARY    all allocations freed\n",
                          tid, get_thread_name());
         }
-        if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
+        if (n > 0) write(g_outfd, buf, (size_t)n);
     }
 
     pthread_mutex_unlock(&g_lock);
     in_hook = false;
 }
 
-// ---------------------------------------------------------------------------
-// Size filter  (MEMTRACK_MIN_SIZE env var)
-// ---------------------------------------------------------------------------
-static size_t g_min_size = 0;
-
 static void __attribute__((constructor)) memtrack_ctor()
 {
     pthread_key_create(&exit_key, thread_exit_handler);
-    const char* env = getenv("MEMTRACK_MIN_SIZE");
-    if (env) g_min_size = (size_t)strtoull(env, nullptr, 10);
+
+    const char* out = getenv("MEMTRACK_OUTPUT");
+    if (out) {
+        int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0)
+            g_outfd = fd;
+        else {
+            const char msg[] = "[memtrack] WARNING: could not open output file, falling back to stderr\n";
+            write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        }
+    }
+
+    const char* min = getenv("MEMTRACK_MIN_SIZE");
+    if (min) g_min_size = (size_t)strtoull(min, nullptr, 10);
 }
 
 static inline void ensure_exit_hook()
@@ -227,7 +242,7 @@ static void log_alloc(const char* op, size_t size, void* ptr)
                      "[memtrack] tid=%-6d (%-15s) %-10s size=%-12zu  total=%-12zu  ptr=%p\n",
                      get_tid(), get_thread_name(), op, size, thread_total, ptr);
     if (n > 0)
-        write(STDERR_FILENO, buf, (size_t)n);
+        write(g_outfd, buf, (size_t)n);
 }
 
 // ---------------------------------------------------------------------------
