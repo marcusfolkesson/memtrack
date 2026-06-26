@@ -28,10 +28,11 @@ All output goes to **stderr** so it does not interfere with your application's s
 
 ### Environment variables
 
-| Variable            | Default | Description |
-|---------------------|---------|-------------|
-| `MEMTRACK_MIN_SIZE` | `0`     | Suppress logging and leak tracking for allocations smaller than this many bytes. The per-thread `total` counter is unaffected and always reflects all allocations. |
-| `MEMTRACK_OUTPUT`   | _(stderr)_ | Write all output to this file instead of stderr. The file is created (or truncated) at startup. If the file cannot be opened, a warning is printed to stderr and output falls back to stderr. |
+| Variable              | Default | Description |
+|-----------------------|---------|-------------|
+| `MEMTRACK_MIN_SIZE`   | `0`     | Suppress logging and leak tracking for allocations smaller than this many bytes. The per-thread `total` counter is unaffected and always reflects all allocations. |
+| `MEMTRACK_OUTPUT`     | _(stderr)_ | Write all output to this file instead of stderr. The file is created (or truncated) at startup. If the file cannot be opened, a warning is printed to stderr and output falls back to stderr. |
+| `MEMTRACK_STACK_DEPTH`| `0`     | Number of call stack frames to capture and print per allocation (0 = disabled). Frames are also stored and replayed in LEAK reports. Compile your application with `-rdynamic` for resolved symbol names. |
 
 ## Output format
 

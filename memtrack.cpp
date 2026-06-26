@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <execinfo.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <stdio.h>
@@ -77,13 +78,15 @@ static __thread bool   key_set      = false;
 static __thread char   thread_name[16] = {};   // cached on first use; max 15 chars + NUL
 
 static const char* get_thread_name();  // forward declaration
+static void print_frames(void**, int); // forward declaration
 
 // ---------------------------------------------------------------------------
 // Output fd and size filter  (MEMTRACK_OUTPUT / MEMTRACK_MIN_SIZE env vars)
 // Defined here so thread_exit_handler (below) can reference them.
 // ---------------------------------------------------------------------------
-static int    g_outfd    = STDERR_FILENO;
-static size_t g_min_size = 0;
+static int    g_outfd       = STDERR_FILENO;
+static size_t g_min_size    = 0;
+static int    g_stack_depth = 0;   // 0 = stack traces disabled
 
 // ---------------------------------------------------------------------------
 // Global allocation map  (ptr -> {tid, size, op})
@@ -96,13 +99,16 @@ struct AllocInfo {
     pid_t  tid;
     size_t size;
     char   op[12];
+    int    frame_count;
+    void*  frames[32];  // raw PCs captured at allocation time
 };
 
 static std::unordered_map<void*, AllocInfo>* g_map  = nullptr;
 static pthread_mutex_t                        g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Record a user allocation.  Caller must have set in_hook = true first.
-static void map_record(void* ptr, size_t size, const char* op)
+static void map_record(void* ptr, size_t size, const char* op,
+                       void** frames, int frame_count)
 {
     if (!ptr || is_bootstrap_ptr(ptr)) return;
     pthread_mutex_lock(&g_lock);
@@ -113,6 +119,8 @@ static void map_record(void* ptr, size_t size, const char* op)
     info.size = size;
     strncpy(info.op, op, sizeof(info.op) - 1);
     info.op[sizeof(info.op) - 1] = '\0';
+    info.frame_count = frame_count;
+    for (int i = 0; i < frame_count; i++) info.frames[i] = frames[i];
     (*g_map)[ptr] = info;
     pthread_mutex_unlock(&g_lock);
 }
@@ -162,6 +170,8 @@ static void thread_exit_handler(void*)
                          "[memtrack] tid=%-6d (%-15s) LEAK       %-10s size=%-12zu  ptr=%p\n",
                          tid, get_thread_name(), info.op, info.size, ptr);
             if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (info.frame_count > 0)
+                print_frames(info.frames, info.frame_count);
         }
 
         // Second pass: erase this thread's entries.
@@ -203,6 +213,9 @@ static void __attribute__((constructor)) memtrack_ctor()
 
     const char* min = getenv("MEMTRACK_MIN_SIZE");
     if (min) g_min_size = (size_t)strtoull(min, nullptr, 10);
+
+    const char* depth = getenv("MEMTRACK_STACK_DEPTH");
+    if (depth) g_stack_depth = atoi(depth);
 }
 
 static inline void ensure_exit_hook()
@@ -228,6 +241,21 @@ static const char* get_thread_name()
     return thread_name;
 }
 
+// Print symbolised stack frames.  Must be called with in_hook == true.
+// backtrace_symbols() allocates internally; real_free() is used to release it
+// so the freed buffer (which was never tracked) doesn't confuse map_remove.
+static void print_frames(void** frames, int count)
+{
+    char** syms = backtrace_symbols(frames, count);
+    if (!syms) return;
+    char buf[512];
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, syms[i]);
+        if (n > 0) write(g_outfd, buf, (size_t)n);
+    }
+    real_free(syms);
+}
+
 static void log_alloc(const char* op, size_t size, void* ptr)
 {
     ensure_exit_hook();
@@ -235,7 +263,20 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 
     if (size < g_min_size) return;
 
-    map_record(ptr, size, op);
+    // Capture stack frames before doing anything else so the trace is accurate.
+    // Skip 2 internal frames: log_alloc itself + the hook (malloc/calloc/etc.).
+    void* frames[32];
+    int   frame_count = 0;
+    if (g_stack_depth > 0) {
+        const int skip  = 2;
+        const int total = g_stack_depth + skip;
+        int raw = backtrace(frames, total < 32 ? total : 32);
+        frame_count = (raw > skip) ? raw - skip : 0;
+        // Shift: drop the first `skip` internal frames
+        for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
+    }
+
+    map_record(ptr, size, op, frames, frame_count);
 
     char buf[256];
     int n = snprintf(buf, sizeof(buf),
@@ -243,6 +284,9 @@ static void log_alloc(const char* op, size_t size, void* ptr)
                      get_tid(), get_thread_name(), op, size, thread_total, ptr);
     if (n > 0)
         write(g_outfd, buf, (size_t)n);
+
+    if (frame_count > 0)
+        print_frames(frames, frame_count);
 }
 
 // ---------------------------------------------------------------------------
