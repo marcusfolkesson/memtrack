@@ -26,6 +26,12 @@ LD_PRELOAD=./memtrack.so ./your_app
 
 All output goes to **stderr** so it does not interfere with your application's stdout.
 
+### Environment variables
+
+| Variable            | Default | Description |
+|---------------------|---------|-------------|
+| `MEMTRACK_MIN_SIZE` | `0`     | Suppress logging and leak tracking for allocations smaller than this many bytes. The per-thread `total` counter is unaffected and always reflects all allocations. |
+
 ## Output format
 
 ### Per allocation

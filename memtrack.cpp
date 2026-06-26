@@ -19,6 +19,7 @@
 #include <string.h>
 #include <new>
 #include <unordered_map>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // Bootstrap allocator
@@ -177,9 +178,16 @@ static void thread_exit_handler(void*)
     in_hook = false;
 }
 
+// ---------------------------------------------------------------------------
+// Size filter  (MEMTRACK_MIN_SIZE env var)
+// ---------------------------------------------------------------------------
+static size_t g_min_size = 0;
+
 static void __attribute__((constructor)) memtrack_ctor()
 {
     pthread_key_create(&exit_key, thread_exit_handler);
+    const char* env = getenv("MEMTRACK_MIN_SIZE");
+    if (env) g_min_size = (size_t)strtoull(env, nullptr, 10);
 }
 
 static inline void ensure_exit_hook()
@@ -209,6 +217,9 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 {
     ensure_exit_hook();
     thread_total += size;
+
+    if (size < g_min_size) return;
+
     map_record(ptr, size, op);
 
     char buf[256];
