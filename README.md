@@ -31,12 +31,13 @@ All output goes to **stderr** so it does not interfere with your application's s
 ### Per allocation
 
 ```
-[memtrack] tid=<tid>   <op>       size=<bytes>      total=<bytes>      ptr=<address>
+[memtrack] tid=<tid> (<name>          ) <op>       size=<bytes>      total=<bytes>      ptr=<address>
 ```
 
 | Field   | Description                                      |
 |---------|--------------------------------------------------|
 | `tid`   | Linux thread ID (`gettid`)                       |
+| `name`  | Thread name (set via `pthread_setname_np`; up to 15 chars) |
 | `op`    | Operation: `malloc`, `calloc`, `realloc`, `new`, `new[]` |
 | `size`  | Bytes requested in this call                     |
 | `total` | Cumulative bytes allocated by this thread so far |
@@ -45,26 +46,26 @@ All output goes to **stderr** so it does not interfere with your application's s
 ### On thread exit
 
 ```
-[memtrack] tid=<tid>   EXIT       total=<bytes>   bytes allocated
-[memtrack] tid=<tid>   LEAK       <op>       size=<bytes>   ptr=<address>
-[memtrack] tid=<tid>   SUMMARY    <N> unfreed allocation(s), <bytes> bytes leaked
+[memtrack] tid=<tid> (<name>          ) EXIT       total=<bytes>   bytes allocated
+[memtrack] tid=<tid> (<name>          ) LEAK       <op>       size=<bytes>   ptr=<address>
+[memtrack] tid=<tid> (<name>          ) SUMMARY    <N> unfreed allocation(s), <bytes> bytes leaked
 ```
 
 If all allocations were freed:
 
 ```
-[memtrack] tid=<tid>   SUMMARY    all allocations freed
+[memtrack] tid=<tid> (<name>          ) SUMMARY    all allocations freed
 ```
 
 ### Example
 
 ```
-[memtrack] tid=12345  malloc     size=1024         total=1024          ptr=0x...
-[memtrack] tid=12345  realloc    size=2048         total=3072          ptr=0x...
-[memtrack] tid=12346  malloc     size=128          total=128           ptr=0x...
-[memtrack] tid=12346  EXIT       total=128         bytes allocated
-[memtrack] tid=12346  LEAK       malloc     size=128          ptr=0x...
-[memtrack] tid=12346  SUMMARY    1 unfreed allocation(s), 128 bytes leaked
+[memtrack] tid=12345  (main           ) malloc     size=1024         total=1024          ptr=0x...
+[memtrack] tid=12345  (main           ) realloc    size=2048         total=3072          ptr=0x...
+[memtrack] tid=12346  (worker-1       ) malloc     size=128          total=128           ptr=0x...
+[memtrack] tid=12346  (worker-1       ) EXIT       total=128         bytes allocated
+[memtrack] tid=12346  (worker-1       ) LEAK       malloc     size=128          ptr=0x...
+[memtrack] tid=12346  (worker-1       ) SUMMARY    1 unfreed allocation(s), 128 bytes leaked
 ```
 
 ## Test

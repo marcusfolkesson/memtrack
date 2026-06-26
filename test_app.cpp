@@ -10,6 +10,10 @@
 static void* thread_fn(void* arg)
 {
     int id = *(int*)arg;
+    char name[16];
+    snprintf(name, sizeof(name), "worker-%d", id);
+    pthread_setname_np(pthread_self(), name);
+
     printf("[test] thread %d starting allocations\n", id);
 
     void* a = malloc(128);

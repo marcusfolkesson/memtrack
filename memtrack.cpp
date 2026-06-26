@@ -72,6 +72,9 @@ static void resolve()
 static __thread bool   in_hook      = false;
 static __thread size_t thread_total = 0;
 static __thread bool   key_set      = false;
+static __thread char   thread_name[16] = {};   // cached on first use; max 15 chars + NUL
+
+static const char* get_thread_name();  // forward declaration
 
 // ---------------------------------------------------------------------------
 // Global allocation map  (ptr -> {tid, size, op})
@@ -125,12 +128,12 @@ static pthread_key_t exit_key;
 static void thread_exit_handler(void*)
 {
     pid_t tid = (pid_t)syscall(SYS_gettid);
-    char  buf[200];
+    char  buf[256];
     int   n;
 
     n = snprintf(buf, sizeof(buf),
-                 "[memtrack] tid=%-6d EXIT       total=%-12zu bytes allocated\n",
-                 tid, thread_total);
+                 "[memtrack] tid=%-6d (%-15s) EXIT       total=%-12zu bytes allocated\n",
+                 tid, get_thread_name(), thread_total);
     if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
 
     // Set in_hook so that g_map->erase() below does not try to re-enter the map.
@@ -147,8 +150,8 @@ static void thread_exit_handler(void*)
             ++leak_count;
             leak_bytes += info.size;
             n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d LEAK       %-10s size=%-12zu  ptr=%p\n",
-                         tid, info.op, info.size, ptr);
+                         "[memtrack] tid=%-6d (%-15s) LEAK       %-10s size=%-12zu  ptr=%p\n",
+                         tid, get_thread_name(), info.op, info.size, ptr);
             if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
         }
 
@@ -160,11 +163,12 @@ static void thread_exit_handler(void*)
 
         if (leak_count > 0) {
             n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
-                         tid, leak_count, leak_bytes);
+                         "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
+                         tid, get_thread_name(), leak_count, leak_bytes);
         } else {
             n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d SUMMARY    all allocations freed\n", tid);
+                         "[memtrack] tid=%-6d (%-15s) SUMMARY    all allocations freed\n",
+                         tid, get_thread_name());
         }
         if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
     }
@@ -194,16 +198,23 @@ static pid_t get_tid()
     return (pid_t)syscall(SYS_gettid);
 }
 
+static const char* get_thread_name()
+{
+    if (thread_name[0] == '\0')
+        pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+    return thread_name;
+}
+
 static void log_alloc(const char* op, size_t size, void* ptr)
 {
     ensure_exit_hook();
     thread_total += size;
     map_record(ptr, size, op);
 
-    char buf[200];
+    char buf[256];
     int n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d %-10s size=%-12zu  total=%-12zu  ptr=%p\n",
-                     get_tid(), op, size, thread_total, ptr);
+                     "[memtrack] tid=%-6d (%-15s) %-10s size=%-12zu  total=%-12zu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op, size, thread_total, ptr);
     if (n > 0)
         write(STDERR_FILENO, buf, (size_t)n);
 }
