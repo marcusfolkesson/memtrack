@@ -364,6 +364,10 @@ static void log_free(void* ptr, const char* op)
 {
     if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
 
+    // Hold in_hook for the entire function so that any allocation made
+    // internally (backtrace_symbols, __cxa_demangle, etc.) is NOT tracked.
+    in_hook = true;
+
     uint64_t ts = elapsed_us();
 
     // Capture stack trace before touching the map.
@@ -381,16 +385,17 @@ static void log_free(void* ptr, const char* op)
     // either filtered out at allocation time or allocated before memtrack loaded.
     size_t size    = 0;
     bool   tracked = false;
-    in_hook = true;
     pthread_mutex_lock(&g_lock);
     if (g_map) {
         auto it = g_map->find(ptr);
         if (it != g_map->end()) { size = it->second.size; tracked = true; }
     }
     pthread_mutex_unlock(&g_lock);
-    in_hook = false;
 
-    if (!tracked) return;
+    if (!tracked) {
+        in_hook = false;
+        return;
+    }
 
     char buf[384];
     int n = snprintf(buf, sizeof(buf),
@@ -401,6 +406,8 @@ static void log_free(void* ptr, const char* op)
 
     if (frame_count > 0)
         print_frames(frames, frame_count);
+
+    in_hook = false;
 }
 
 // ---------------------------------------------------------------------------
