@@ -159,10 +159,11 @@ The detail pane shows **Time** (when the allocation occurred) and, for freed all
 
 | Key | Action |
 |-----|--------|
-| `↑` `↓` / `k` `j` | Navigate allocation list (or scroll detail pane when focused) |
+| `↑` `↓` / `k` `j` | Navigate allocation list (or scroll active pane when focused) |
 | `PgUp` `PgDn` / `Ctrl-b` `Ctrl-f` | Scroll by page |
 | `Home` `End` / `g` `G` | Jump to top / bottom |
-| `Tab` / `←` `→` / `h` `l` | Switch focus between list and detail pane |
+| `Tab` / `→` / `l` | Cycle focus forward: **list → detail → hot-fn → list** |
+| `←` / `h` | Cycle focus backward |
 | `f` | Cycle filter: **All → Leaks → Active → Freed** |
 | `t` | Cycle thread filter |
 | `s` | Cycle sort: **Time → Size → Thread** |
@@ -190,6 +191,29 @@ A test application exercises allocations across multiple threads and deliberatel
 ```sh
 make test
 ```
+
+### Hot functions pane
+
+At the bottom of the screen, a **7-row pane** (2 header rows + 5 data rows) lists **all unique call sites ranked by net unfreed bytes** — bytes allocated minus bytes freed for each caller. The 5 visible rows scroll independently from the rest of the UI.
+
+```
+┌─ Top functions  3-7/12 ────────────────────────────────────────────────────────────────────────────────────┐
+│  Function                                               Allocated      Freed        Net (live)              │
+│  main                                                   3,072 B        2,048 B      1,024 B                 │
+│  thread_fn(void*)                                       512 B          0 B          512 B                   │
+│  malloc                                                 256 B          256 B        0 B                     │
+│  calloc                                                 128 B          128 B        0 B                     │
+│  _IO_file_doallocate                                    4,096 B        4,096 B      0 B                     │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- Press **Tab** (or `l` / `→`) to focus the hot-functions pane; its title changes to show navigation hints.  When focused, use `j`/`k`, `Ctrl-f`/`Ctrl-b`, `g`/`G` to scroll.
+- A **scroll indicator** (`N-M/total`) in the title shows the visible range.
+- Function names are extracted from `frame #0` of each allocation's stack trace (the most immediate caller of `malloc`/`new`/etc.).
+- When no stack trace is available (e.g., `MEMTRACK_STACK_DEPTH=0`), the grouping key falls back to the raw operation name (`malloc`, `calloc`, …).
+- The pane respects the current **thread filter** (`t` key).
+- The top offender (net > 0) is highlighted **bold red**; others with unfreed bytes are **red**; fully freed functions are **green**.
+- For functions to appear by name, the binary must be compiled with `-rdynamic` and the relevant functions must not be `static` (static symbols are invisible to `backtrace_symbols()`). Inlined functions will appear under the caller's name; use `__attribute__((noinline))` on hot functions to get accurate attribution.
 
 ---
 

@@ -378,6 +378,8 @@ struct UI {
     int            list_top      = 0;    // scroll offset in list pane
     int            detail_top    = 0;    // scroll offset in detail pane
     bool           focus_detail  = false;
+    bool           focus_hotfn  = false;
+    int            hotfn_top    = 0;    // scroll offset in hot-fn pane
     bool           live          = false;
     bool           auto_follow   = true; // scroll to newest in live mode
 
@@ -424,6 +426,7 @@ struct UI {
             selected   = 0;
             list_top   = 0;
             detail_top = 0;
+            hotfn_top  = 0;
         } else {
             selected = min(selected, (int)visible.size() - 1);
             if (selected < 0) selected = 0;
@@ -464,10 +467,73 @@ static string fmt_time_ms(uint64_t us)
 static void hline_to_eol(WINDOW* w, int y, int col_pair)
 {
     int h, width; getmaxyx(w, h, width); (void)h;
+    // When the previous write exactly filled the row, the cursor wraps to the
+    // next row (getcury > y).  In that case the row is already fully painted —
+    // overwriting it with spaces would erase the content we just wrote.
+    if (getcury(w) != y) return;
     int x = getcurx(w);
     wattron(w, COLOR_PAIR(col_pair));
     while (x < width) { mvwaddch(w, y, x++, ' '); }
     wattroff(w, COLOR_PAIR(col_pair));
+}
+
+// ─── Hot-function aggregation ─────────────────────────────────────────────────
+//
+// Groups every AllocRecord by the function in frame #0 of its alloc stack
+// (falling back to the op name if no frames were captured).  Returns the top N
+// callers ranked by net unfreed bytes (allocated − freed).
+
+struct FuncStat {
+    string name;
+    size_t allocated = 0;
+    size_t freed     = 0;
+    size_t net() const { return allocated >= freed ? allocated - freed : 0; }
+};
+
+// Extract the demangled function name from a backtrace_symbols line.
+// Input looks like:  ./binary(SomeName()+0xNN) [0xADDR]
+// Returns "SomeName()" or, when no symbol is available, the module path.
+static string extract_func_name(const string& frame)
+{
+    auto lp   = frame.find('(');
+    if (lp == string::npos) return frame;
+    // Search for "+0x" (the offset marker) rather than any '+' or ')' so that
+    // demangled names containing parentheses (e.g. "test()" or "foo(int, void*)")
+    // are extracted correctly.
+    auto plus = frame.find("+0x", lp + 1);
+    if (plus == string::npos || plus == lp + 1)
+        return frame.substr(0, lp);         // no symbol — use module name
+    return frame.substr(lp + 1, plus - lp - 1);
+}
+
+static vector<FuncStat> compute_hot_funcs(const ParseState& ps, int tid_filter,
+                                           int top_n = 5)
+{
+    unordered_map<string, FuncStat> agg;
+
+    for (const auto& r : ps.records) {
+        if (tid_filter != -1 && r.tid != tid_filter) continue;
+        const string key = r.frames.empty()
+                           ? r.op
+                           : extract_func_name(r.frames[0]);
+        auto& s   = agg[key];
+        s.name     = key;
+        s.allocated += r.size;
+        if (r.freed) s.freed += r.size;
+    }
+
+    vector<FuncStat> result;
+    result.reserve(agg.size());
+    for (auto& [name, stat] : agg)
+        result.push_back(std::move(stat));
+
+    std::stable_sort(result.begin(), result.end(),
+                     [](const FuncStat& a, const FuncStat& b) {
+                         return a.net() > b.net();
+                     });
+
+    if ((int)result.size() > top_n) result.resize((size_t)top_n);
+    return result;
 }
 
 // ─── Draw: header ────────────────────────────────────────────────────────────
@@ -560,8 +626,8 @@ static void draw_list(WINDOW* w, const UI& ui)
         string sz = fmt_size(r.size);
 
         int cp = r.is_leak ? C_LEAK : (r.freed ? C_FREE : C_ALLOC);
-        if (sel && !ui.focus_detail) cp = C_SEL;
-        attr_t attr = (sel && !ui.focus_detail) ? A_BOLD : 0;
+        if (sel && !ui.focus_detail && !ui.focus_hotfn) cp = C_SEL;
+        attr_t attr = (sel && !ui.focus_detail && !ui.focus_hotfn) ? A_BOLD : 0;
         if (r.is_leak) attr |= A_BOLD;
 
         wattron(w, COLOR_PAIR(cp) | attr);
@@ -646,7 +712,7 @@ static void draw_detail(WINDOW* w, const UI& ui)
     werase(w);
 
     // Sub-header
-    bool focused = ui.focus_detail;
+    bool focused = ui.focus_detail && !ui.focus_hotfn;
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
     mvwprintw(w, 0, 0, " Detail%s", focused ? " [↑↓ scroll]" : "");
     hline_to_eol(w, 0, C_HEADER);
@@ -713,11 +779,78 @@ static void draw_status(WINDOW* w, const UI& ui)
 
     // Key hints
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
-    mvwprintw(w, 1, 0,
-              " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot%s",
-              ui.live ? "  F:follow" : "");
+    if (ui.focus_hotfn)
+        mvwprintw(w, 1, 0,
+                  " j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
+    else
+        mvwprintw(w, 1, 0,
+                  " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot%s",
+                  ui.live ? "  F:follow" : "");
     hline_to_eol(w, 1, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
+
+    wrefresh(w);
+}
+
+// ─── Draw: hot functions pane ────────────────────────────────────────────────
+
+static void draw_hotfn(WINDOW* w, const UI& ui)
+{
+    int rows, cols; getmaxyx(w, rows, cols);
+    werase(w);
+
+    bool focused = ui.focus_hotfn;
+
+    // Compute ALL functions (no top_n cap) — sorted by net unfreed bytes desc.
+    auto funcs = compute_hot_funcs(*ui.ps, ui.tid_filter, INT_MAX);
+    int  total  = (int)funcs.size();
+    int  page   = rows - 2;          // visible data rows
+
+    // Clamp scroll offset (const_cast-free: caller must clamp before calling)
+    int top = max(0, min(ui.hotfn_top, max(0, total - page)));
+
+    // Title row
+    wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    mvwaddstr(w, 0, 0, focused ? " Top functions [j/k:scroll  Tab:unfocus]" :
+                                 " Top functions by unfreed memory");
+    if (ui.tid_filter != -1) {
+        for (auto& t : ui.ps->threads)
+            if (t.tid == ui.tid_filter)
+                wprintw(w, "  [thread: %s]", t.name.c_str());
+    }
+    // Scroll indicator in title
+    if (total > page) {
+        char scroll_info[32];
+        snprintf(scroll_info, sizeof(scroll_info), " %d-%d/%d ",
+                 top + 1, min(top + page, total), total);
+        int si_len = (int)strlen(scroll_info);
+        int h2; getmaxyx(w, h2, cols); (void)h2;
+        mvwaddstr(w, 0, cols - si_len, scroll_info);
+    }
+    hline_to_eol(w, 0, C_HEADER);
+
+    // Column header
+    int name_w = max(8, cols - 37);
+    mvwprintw(w, 1, 0, " %-*s  %10s  %10s  %10s",
+              name_w, "Function", "Allocated", "Freed", "Net (live)");
+    hline_to_eol(w, 1, C_HEADER);
+    wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+
+    // Data rows
+    for (int i = 0; i < page && (top + i) < total; i++) {
+        const auto& f   = funcs[top + i];
+        size_t net      = f.net();
+        int cp          = (net > 0) ? C_LEAK : C_ALLOC;
+        int attr        = (i == 0 && top == 0 && net > 0) ? (int)A_BOLD : 0;
+        wattron(w, COLOR_PAIR(cp) | attr);
+        mvwprintw(w, i + 2, 0, " %-*.*s  %10s  %10s  %10s",
+                  name_w, name_w, f.name.c_str(),
+                  fmt_size(f.allocated).c_str(),
+                  fmt_size(f.freed).c_str(),
+                  fmt_size(net).c_str());
+        hline_to_eol(w, i + 2, cp);
+        wattroff(w, COLOR_PAIR(cp) | attr);
+    }
 
     wrefresh(w);
 }
@@ -725,35 +858,41 @@ static void draw_status(WINDOW* w, const UI& ui)
 // ─── Window management ───────────────────────────────────────────────────────
 
 struct Windows {
-    WINDOW *header, *list, *detail, *status;
+    WINDOW *header, *list, *detail, *hotfn, *status;
 };
 
 // Exact column width required for the list pane:
 //   " [X] " (5) + ptr "%-18s " (19) + op "%-9s " (10) +
 //   time "%-12s " (13) + size "%-9s " (10) + thread "%-15s" (15) = 72
-static constexpr int LIST_W = 72;
+static constexpr int LIST_W  = 72;
+// Hot-function pane height: 1 title + 1 col header + 5 data rows
+static constexpr int HOTFN_H = 7;
 
 // Actual list pane width — shrinks to half on very narrow terminals so the
 // detail pane always gets at least 30 columns.
 static int list_pane_w() { return (COLS >= LIST_W + 30) ? LIST_W : COLS / 2; }
+// Body height: total rows minus header(2), hotfn pane, and status(2).
+static int body_height()  { return LINES - 2 - HOTFN_H - 2; }
 
 static Windows make_windows()
 {
     int rows = LINES, cols = COLS;
-    int lw   = list_pane_w();
-    int body = rows - 4;   // 2 header + 2 status
+    int lw     = list_pane_w();
+    int body   = body_height();
+    int hotfn_y = 2 + body;
     return {
-        newwin(2,    cols,       0,      0),
-        newwin(body, lw,         2,      0),
-        newwin(body, cols-lw-1,  2,      lw+1),
-        newwin(2,    cols,       rows-2, 0),
+        newwin(2,       cols,       0,        0),
+        newwin(body,    lw,         2,        0),
+        newwin(body,    cols-lw-1,  2,        lw+1),
+        newwin(HOTFN_H, cols,       hotfn_y,  0),
+        newwin(2,       cols,       rows-2,   0),
     };
 }
 
 static void free_windows(Windows& w)
 {
     delwin(w.header); delwin(w.list);
-    delwin(w.detail); delwin(w.status);
+    delwin(w.detail); delwin(w.hotfn); delwin(w.status);
 }
 
 // ─── Main UI loop ────────────────────────────────────────────────────────────
@@ -781,12 +920,13 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
     auto redraw = [&]() {
         int lw = list_pane_w();
         attron(COLOR_PAIR(C_DIM) | A_DIM);
-        mvvline(2, lw, ACS_VLINE, LINES - 4);
+        mvvline(2, lw, ACS_VLINE, body_height());
         attroff(COLOR_PAIR(C_DIM) | A_DIM);
         refresh();
         draw_header(win.header, ui, filename);
         draw_list(win.list, ui);
         draw_detail(win.detail, ui);
+        draw_hotfn(win.hotfn, ui);
         draw_status(win.status, ui);
     };
 
@@ -839,10 +979,24 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             continue;
         }
 
-        // Pane switch
+        // Pane switch: Tab / h / l cycles  list → detail → hotfn → list
+        //             h / left  : backward;  l / right / Tab : forward
         if (ch == '\t' || ch == KEY_LEFT || ch == KEY_RIGHT ||
             ch == 'h'  || ch == 'l') {
-            ui.focus_detail = !ui.focus_detail;
+            bool fwd = (ch == '\t' || ch == KEY_RIGHT || ch == 'l');
+            if (!ui.focus_detail && !ui.focus_hotfn) {
+                // list → detail (fwd) or list → hotfn (bwd)
+                if (fwd) { ui.focus_detail = true;  ui.focus_hotfn = false; }
+                else     { ui.focus_detail = false; ui.focus_hotfn = true;  }
+            } else if (ui.focus_detail) {
+                // detail → hotfn (fwd) or detail → list (bwd)
+                if (fwd) { ui.focus_detail = false; ui.focus_hotfn = true;  }
+                else     { ui.focus_detail = false; ui.focus_hotfn = false; }
+            } else {
+                // hotfn → list (fwd) or hotfn → detail (bwd)
+                if (fwd) { ui.focus_detail = false; ui.focus_hotfn = false; }
+                else     { ui.focus_detail = true;  ui.focus_hotfn = false; }
+            }
             redraw();
             continue;
         }
@@ -854,7 +1008,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             continue;
         }
 
-        if (!ui.focus_detail) {
+        if (!ui.focus_detail && !ui.focus_hotfn) {
             // ── List navigation ──────────────────────────────────────────
             int h, w2; getmaxyx(win.list, h, w2); (void)w2;
             int page = h - 2;
@@ -932,7 +1086,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 }
                 ui.rebuild();
             }
-        } else {
+        } else if (ui.focus_detail) {
             // ── Detail pane navigation ───────────────────────────────────
             int h, w2; getmaxyx(win.detail, h, w2); (void)w2;
             int page = h - 2;
@@ -942,6 +1096,18 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             else if (ch == KEY_NPAGE || ch == ctrl('f')) ui.detail_top += page;
             else if (ch == KEY_HOME || ch == 'g') ui.detail_top = 0;
             else if (ch == 'G') ui.detail_top = INT_MAX;  // clamped on draw
+        } else {
+            // ── Hot-fn pane navigation ───────────────────────────────────
+            int page = HOTFN_H - 2;
+            auto funcs = compute_hot_funcs(*ui.ps, ui.tid_filter, INT_MAX);
+            int  total = (int)funcs.size();
+            int  max_top = max(0, total - page);
+            if      (ch == KEY_UP   || ch == 'k') ui.hotfn_top = max(0, ui.hotfn_top - 1);
+            else if (ch == KEY_DOWN || ch == 'j') ui.hotfn_top = min(max_top, ui.hotfn_top + 1);
+            else if (ch == KEY_PPAGE || ch == ctrl('b')) ui.hotfn_top = max(0, ui.hotfn_top - page);
+            else if (ch == KEY_NPAGE || ch == ctrl('f')) ui.hotfn_top = min(max_top, ui.hotfn_top + page);
+            else if (ch == KEY_HOME || ch == 'g') ui.hotfn_top = 0;
+            else if (ch == 'G') ui.hotfn_top = max_top;
         }
 
         next_draw:
@@ -959,9 +1125,12 @@ int main(int argc, char* argv[])
     bool   live = false;
     string path;
 
+    bool dump_hotfn = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--follow"))
             live = true;
+        else if (!strcmp(argv[i], "--dump-hotfn"))
+            dump_hotfn = true;
         else if (argv[i][0] != '-' || !strcmp(argv[i], "-"))
             path = argv[i];
     }
@@ -988,6 +1157,24 @@ int main(int argc, char* argv[])
                         "Make sure MEMTRACK_MIN_SIZE is not filtering everything out.\n",
                 path.c_str());
         return 1;
+    }
+
+    // Diagnostic mode: dump hot functions and exit (no ncurses).
+    if (dump_hotfn) {
+        auto funcs = compute_hot_funcs(ps, -1, 10);
+        printf("Records: %zu  |  Hot functions (top %zu):\n\n",
+               ps.records.size(), funcs.size());
+        printf("  %-45s  %12s  %12s  %12s\n",
+               "Function", "Allocated", "Freed", "Net (live)");
+        printf("  %s\n", string(88, '-').c_str());
+        for (auto& f : funcs) {
+            printf("  %-45s  %12s  %12s  %12s\n",
+                   f.name.c_str(),
+                   fmt_size(f.allocated).c_str(),
+                   fmt_size(f.freed).c_str(),
+                   fmt_size(f.net()).c_str());
+        }
+        return 0;
     }
 
     // In live mode, open the reader from where the initial parse left off.
