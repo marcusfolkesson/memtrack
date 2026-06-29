@@ -44,12 +44,14 @@ struct AllocRecord {
     string    op;               // malloc / calloc / realloc / new / new[]
     size_t    size        = 0;
     size_t    total       = 0;
+    uint64_t  timestamp_us = 0; // µs since program start
     vector<string> frames;
 
-    bool   freed          = false;
-    int    free_tid       = 0;
-    string free_thread_name;
-    string free_op;             // free / delete / delete[]
+    bool     freed             = false;
+    int      free_tid          = 0;
+    string   free_thread_name;
+    string   free_op;             // free / delete / delete[]
+    uint64_t free_timestamp_us = 0;
     vector<string> free_frames;
 
     bool   is_leak        = false;  // flagged in a LEAK line at thread exit
@@ -159,7 +161,8 @@ static void parse_line(const char* line, ParseState& st)
         char   lop[32] = {};
         size_t sz      = 0;
         void*  ptr_raw = nullptr;
-        sscanf(after, "LEAK %31s size=%zu ptr=%p", lop, &sz, &ptr_raw);
+        unsigned long long ts_ull = 0;
+        sscanf(after, "LEAK ts=%llu %31s size=%zu ptr=%p", &ts_ull, lop, &sz, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
         auto it = st.ptr_idx.find(ptr);
         if (it != st.ptr_idx.end()) {
@@ -174,16 +177,18 @@ static void parse_line(const char* line, ParseState& st)
     if (is_alloc_op(op)) {
         size_t sz = 0, total = 0;
         void*  ptr_raw = nullptr;
-        sscanf(after, "%*s size=%zu total=%zu ptr=%p", &sz, &total, &ptr_raw);
+        unsigned long long ts_ull = 0;
+        sscanf(after, "%*s ts=%llu size=%zu total=%zu ptr=%p", &ts_ull, &sz, &total, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
         AllocRecord rec;
-        rec.ptr         = ptr;
-        rec.tid         = tid;
-        rec.thread_name = tname;
-        rec.op          = op;
-        rec.size        = sz;
-        rec.total       = total;
+        rec.ptr          = ptr;
+        rec.tid          = tid;
+        rec.thread_name  = tname;
+        rec.op           = op;
+        rec.size         = sz;
+        rec.total        = total;
+        rec.timestamp_us = (uint64_t)ts_ull;
 
         size_t idx = st.records.size();
         st.ptr_idx[ptr] = idx;
@@ -197,16 +202,18 @@ static void parse_line(const char* line, ParseState& st)
     if (is_free_op(op)) {
         size_t sz      = 0;
         void*  ptr_raw = nullptr;
-        sscanf(after, "%*s size=%zu ptr=%p", &sz, &ptr_raw);
+        unsigned long long ts_ull = 0;
+        sscanf(after, "%*s ts=%llu size=%zu ptr=%p", &ts_ull, &sz, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
         auto it = st.ptr_idx.find(ptr);
         if (it != st.ptr_idx.end()) {
-            auto& rec           = st.records[it->second];
-            rec.freed           = true;
-            rec.free_tid        = tid;
-            rec.free_thread_name = tname;
-            rec.free_op         = op;
+            auto& rec              = st.records[it->second];
+            rec.freed              = true;
+            rec.free_tid           = tid;
+            rec.free_thread_name   = tname;
+            rec.free_op            = op;
+            rec.free_timestamp_us  = (uint64_t)ts_ull;
             st.last     = ParseState::Last::FREE;
             st.last_rec = it->second;
             st.ptr_idx.erase(it);
@@ -288,6 +295,10 @@ struct UI {
         auto cmp = [&](size_t a, size_t b) {
             int c = 0;
             switch (sort) {
+                case S_TIME:
+                    if (recs[a].timestamp_us != recs[b].timestamp_us)
+                        c = (recs[a].timestamp_us < recs[b].timestamp_us) ? -1 : 1;
+                    break;
                 case S_SIZE:
                     if (recs[a].size != recs[b].size)
                         c = (recs[a].size > recs[b].size) ? -1 : 1;
@@ -297,15 +308,12 @@ struct UI {
                     if (c == 0 && recs[a].tid != recs[b].tid)
                         c = recs[a].tid < recs[b].tid ? -1 : 1;
                     break;
-                default: break;  // S_TIME: keep insertion order
+                default: break;
             }
             if (c == 0) c = (a < b) ? -1 : (a > b ? 1 : 0);
             return sort_rev ? c > 0 : c < 0;
         };
-        if (sort != S_TIME || sort_rev)
-            std::stable_sort(visible.begin(), visible.end(), cmp);
-        if (sort == S_TIME && sort_rev)
-            std::reverse(visible.begin(), visible.end());
+        std::stable_sort(visible.begin(), visible.end(), cmp);
 
         selected   = min(selected, (int)visible.size() - 1);
         if (selected < 0) selected = 0;
@@ -327,6 +335,20 @@ static string fmt_size(size_t sz)
     if      (sz >= 1024*1024) snprintf(buf, sizeof(buf), "%.1f MB", sz/1048576.0);
     else if (sz >= 1024)      snprintf(buf, sizeof(buf), "%.1f KB", sz/1024.0);
     else                      snprintf(buf, sizeof(buf), "%zu B",   sz);
+    return buf;
+}
+
+// Format elapsed microseconds as human-readable time
+static string fmt_time_ms(uint64_t us)
+{
+    char buf[32];
+    double ms = us / 1000.0;
+    if (ms >= 60000.0)
+        snprintf(buf, sizeof(buf), "%.3fs",  ms / 1000.0);
+    else if (ms >= 1000.0)
+        snprintf(buf, sizeof(buf), "%.3fs",  ms / 1000.0);
+    else
+        snprintf(buf, sizeof(buf), "%.3fms", ms);
     return buf;
 }
 
@@ -379,15 +401,16 @@ static void draw_list(WINDOW* w, const UI& ui)
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
     mvwaddstr(w, 0, 0, " St. ");
     waddstr(w, "Pointer            ");
+    waddstr(w, "Op         ");
 
     auto col = [&](const char* label, SortMode sm) {
         if (ui.sort == sm) wattron(w, A_UNDERLINE);
         waddstr(w, label);
         if (ui.sort == sm) wattroff(w, A_UNDERLINE);
     };
-    col("Op         ", S_TIME);    // Op column — sort by time (insertion order)
+    col("Time        ", S_TIME);
     col("Size       ", S_SIZE);
-    col("Thread",      S_THREAD);
+    col("Thread",       S_THREAD);
 
     hline_to_eol(w, 0, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
@@ -412,8 +435,9 @@ static void draw_list(WINDOW* w, const UI& ui)
         if (r.is_leak) attr |= A_BOLD;
 
         wattron(w, COLOR_PAIR(cp) | attr);
-        mvwprintw(w, row + 1, 0, " [%c] %-18s %-9s %-9s %-14s",
+        mvwprintw(w, row + 1, 0, " [%c] %-18s %-9s %-12s %-9s %-14s",
                   status, ptr_buf, r.op.c_str(),
+                  fmt_time_ms(r.timestamp_us).c_str(),
                   sz.c_str(), r.thread_name.c_str());
         int x = getcurx(w);
         while (x < cols) { waddch(w, ' '); x++; }
@@ -454,6 +478,7 @@ static vector<DLine> build_detail(const AllocRecord& r)
     add("  Ptr     : " + string(ptr_buf));
     add("  Size    : " + fmt_size(r.size));
     add("  Total   : " + fmt_size(r.total));
+    add("  Time    : " + fmt_time_ms(r.timestamp_us), C_DIM);
     add("  tid     : " + std::to_string(r.tid), C_THREAD);
     add("  Thread  : " + r.thread_name,         C_THREAD);
     if (!r.frames.empty()) {
@@ -470,6 +495,9 @@ static vector<DLine> build_detail(const AllocRecord& r)
         add("  *** NOT FREED — MEMORY LEAK ***", C_LEAK, A_BOLD);
     } else {
         add("  Op      : " + r.free_op,                   C_FREE,   A_BOLD);
+        add("  Time    : " + fmt_time_ms(r.free_timestamp_us), C_DIM);
+        if (r.free_timestamp_us >= r.timestamp_us)
+            add("  Lifetime: " + fmt_time_ms(r.free_timestamp_us - r.timestamp_us), C_DIM);
         add("  tid     : " + std::to_string(r.free_tid),  C_THREAD);
         add("  Thread  : " + r.free_thread_name,          C_THREAD);
         if (!r.free_frames.empty()) {

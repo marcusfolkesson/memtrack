@@ -20,6 +20,8 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <time.h>
 #include <new>
 #include <unordered_map>
 #include <cstdlib>
@@ -90,6 +92,23 @@ static int    g_outfd       = STDERR_FILENO;
 static size_t g_min_size    = 0;
 static int    g_stack_depth = 0;   // 0 = stack traces disabled
 
+// Monotonic start time – set in memtrack_ctor(); elapsed_us() returns
+// microseconds since then (0 for any allocation before the ctor runs).
+static struct timespec g_start_time = {};
+
+static uint64_t elapsed_us()
+{
+    // Return 0 for any allocation that happens before the constructor fires.
+    if (g_start_time.tv_sec == 0 && g_start_time.tv_nsec == 0)
+        return 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t s  = (int64_t)(now.tv_sec  - g_start_time.tv_sec);
+    int64_t ns = (int64_t)(now.tv_nsec - g_start_time.tv_nsec);
+    if (s < 0) return 0;
+    return (uint64_t)(s * 1000000LL + ns / 1000LL);
+}
+
 // ---------------------------------------------------------------------------
 // Global allocation map  (ptr -> {tid, size, op})
 //
@@ -98,11 +117,12 @@ static int    g_stack_depth = 0;   // 0 = stack traces disabled
 // therefore never inserted into the map themselves.
 // ---------------------------------------------------------------------------
 struct AllocInfo {
-    pid_t  tid;
-    size_t size;
-    char   op[12];
-    int    frame_count;
-    void*  frames[32];  // raw PCs captured at allocation time
+    pid_t    tid;
+    size_t   size;
+    char     op[12];
+    uint64_t timestamp_us;  // microseconds since program start
+    int      frame_count;
+    void*    frames[32];    // raw PCs captured at allocation time
 };
 
 static std::unordered_map<void*, AllocInfo>* g_map  = nullptr;
@@ -110,15 +130,16 @@ static pthread_mutex_t                        g_lock = PTHREAD_MUTEX_INITIALIZER
 
 // Record a user allocation.  Caller must have set in_hook = true first.
 static void map_record(void* ptr, size_t size, const char* op,
-                       void** frames, int frame_count)
+                       void** frames, int frame_count, uint64_t ts)
 {
     if (!ptr || is_bootstrap_ptr(ptr)) return;
     pthread_mutex_lock(&g_lock);
     if (!g_map)
         g_map = new std::unordered_map<void*, AllocInfo>();
     AllocInfo info;
-    info.tid  = (pid_t)syscall(SYS_gettid);
-    info.size = size;
+    info.tid          = (pid_t)syscall(SYS_gettid);
+    info.size         = size;
+    info.timestamp_us = ts;
     strncpy(info.op, op, sizeof(info.op) - 1);
     info.op[sizeof(info.op) - 1] = '\0';
     info.frame_count = frame_count;
@@ -151,8 +172,8 @@ static void thread_exit_handler(void*)
     int   n;
 
     n = snprintf(buf, sizeof(buf),
-                 "[memtrack] tid=%-6d (%-15s) EXIT       total=%-12zu bytes allocated\n",
-                 tid, get_thread_name(), thread_total);
+                 "[memtrack] tid=%-6d (%-15s) EXIT       ts=%-12llu total=%-12zu bytes allocated\n",
+                 tid, get_thread_name(), (unsigned long long)elapsed_us(), thread_total);
     if (n > 0) write(g_outfd, buf, (size_t)n);
 
     // Set in_hook so that g_map->erase() below does not try to re-enter the map.
@@ -169,8 +190,9 @@ static void thread_exit_handler(void*)
             ++leak_count;
             leak_bytes += info.size;
             n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) LEAK       %-10s size=%-12zu  ptr=%p\n",
-                         tid, get_thread_name(), info.op, info.size, ptr);
+                         "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
+                         tid, get_thread_name(), (unsigned long long)info.timestamp_us,
+                         info.op, info.size, ptr);
             if (n > 0) write(g_outfd, buf, (size_t)n);
             if (info.frame_count > 0)
                 print_frames(info.frames, info.frame_count);
@@ -200,6 +222,7 @@ static void thread_exit_handler(void*)
 
 static void __attribute__((constructor)) memtrack_ctor()
 {
+    clock_gettime(CLOCK_MONOTONIC, &g_start_time);
     pthread_key_create(&exit_key, thread_exit_handler);
 
     const char* out = getenv("MEMTRACK_OUTPUT");
@@ -306,6 +329,8 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 
     if (size < g_min_size) return;
 
+    uint64_t ts = elapsed_us();
+
     // Capture stack frames before doing anything else so the trace is accurate.
     // Skip 2 internal frames: log_alloc itself + the hook (malloc/calloc/etc.).
     void* frames[32];
@@ -319,12 +344,13 @@ static void log_alloc(const char* op, size_t size, void* ptr)
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    map_record(ptr, size, op, frames, frame_count);
+    map_record(ptr, size, op, frames, frame_count, ts);
 
-    char buf[256];
+    char buf[384];
     int n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) %-10s size=%-12zu  total=%-12zu  ptr=%p\n",
-                     get_tid(), get_thread_name(), op, size, thread_total, ptr);
+                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  total=%-12zu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op,
+                     (unsigned long long)ts, size, thread_total, ptr);
     if (n > 0)
         write(g_outfd, buf, (size_t)n);
 
@@ -337,6 +363,8 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 static void log_free(void* ptr, const char* op)
 {
     if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
+
+    uint64_t ts = elapsed_us();
 
     // Capture stack trace before touching the map.
     void* frames[32];
@@ -364,10 +392,11 @@ static void log_free(void* ptr, const char* op)
 
     if (!tracked) return;
 
-    char buf[256];
+    char buf[384];
     int n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) %-10s size=%-12zu  ptr=%p\n",
-                     get_tid(), get_thread_name(), op, size, ptr);
+                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op,
+                     (unsigned long long)ts, size, ptr);
     if (n > 0) write(g_outfd, buf, (size_t)n);
 
     if (frame_count > 0)
