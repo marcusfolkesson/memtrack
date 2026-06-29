@@ -5,11 +5,12 @@
  * Usage:  ./memview <log>
  *         ./memview -              (read from stdin)
  *         ./memview -f <log>       (live follow mode)
- *         ./memview -f -           (live follow stdin)
+ *         ./memview :4242          (connect to memtrack TCP server on localhost)
+ *         ./memview host:4242      (connect to memtrack TCP server on host)
  *
  * Keys:
  *   ↑ ↓  PgUp PgDn  Home End   Navigate allocation list
- *   Tab / ← →                  Switch focus: list ↔ detail pane
+ *   Tab / ← →                  Switch focus: list ↔ detail ↔ hot-fn pane
  *   f                           Cycle filter: All → Leaks → Active → Freed
  *   t                           Cycle thread filter
  *   F                           Toggle auto-follow (live mode)
@@ -30,6 +31,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 using std::vector;
 using std::string;
@@ -253,9 +258,11 @@ static ParseState parse_file(const string& path, long* out_pos = nullptr)
 
 struct LiveReader {
     string path;
-    FILE*  fp       = nullptr;
-    long   pos      = 0;
-    bool   is_stdin = false;
+    FILE*  fp           = nullptr;
+    long   pos          = 0;
+    bool   is_stdin     = false;
+    bool   is_socket    = false;  // TCP connection — no seek, EOF = disconnected
+    bool   disconnected = false;  // server closed the connection
 
     // `initial_pos` is the byte offset after the initial parse so we don't
     // re-process already-seen lines.
@@ -277,6 +284,35 @@ struct LiveReader {
         }
     }
 
+    // Connect to a memtrack TCP server.  Returns true on success.
+    // Always implies live mode; the UI header shows the connection address.
+    bool connect_tcp(const string& host, int port)
+    {
+        struct addrinfo hints = {}, *res = nullptr;
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        string port_str   = std::to_string(port);
+
+        if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res)
+            return false;
+
+        int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        bool ok = (sock >= 0) &&
+                  (connect(sock, res->ai_addr, res->ai_addrlen) == 0);
+        freeaddrinfo(res);
+
+        if (!ok) { if (sock >= 0) close(sock); return false; }
+
+        // Non-blocking so poll_new() can return between polls.
+        fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
+        fp          = fdopen(sock, "r");
+        is_socket   = true;
+        is_stdin    = false;
+        disconnected = false;
+        pos         = 0;
+        return fp != nullptr;
+    }
+
     // Read any newly appended lines into `st`.
     // Returns true if the file was truncated (application restarted) — the
     // caller should treat this as a full reset of the display.
@@ -284,16 +320,22 @@ struct LiveReader {
     bool poll_new(ParseState& st, int& new_count)
     {
         new_count = 0;
+        if (disconnected) return false;
 
-        if (!fp && !is_stdin) {
+        if (!fp && !is_stdin && !is_socket) {
             // File may not have appeared yet — try again next poll.
             fp = fopen(path.c_str(), "r");
             if (!fp) return false;
             pos = 0;
         }
 
-        if (!is_stdin) {
-            // Detect truncation: current end is before our read position.
+        if (is_socket || is_stdin) {
+            // Non-blocking stream: check readability before attempting fgets.
+            int raw_fd = fp ? fileno(fp) : (is_stdin ? fileno(stdin) : -1);
+            struct pollfd pfd = { raw_fd, POLLIN, 0 };
+            if (::poll(&pfd, 1, 0) <= 0) return false;
+        } else {
+            // Detect file truncation: current end is before our read position.
             long saved = ftell(fp);
             fseek(fp, 0, SEEK_END);
             long cur_end = ftell(fp);
@@ -308,10 +350,6 @@ struct LiveReader {
                 return true;   // signal: UI should reset
             }
             if (cur_end == pos) return false;  // nothing new
-        } else {
-            // Non-blocking stdin: check readability with poll.
-            struct pollfd pfd = { fileno(stdin), POLLIN, 0 };
-            if (::poll(&pfd, 1, 0) <= 0) return false;
         }
 
         char line_buf[4096];
@@ -322,7 +360,12 @@ struct LiveReader {
             new_count++;
         }
 
-        if (!is_stdin) {
+        if (is_socket) {
+            if (feof(fp)) { disconnected = true; return false; }
+            clearerr(fp);
+        } else if (is_stdin) {
+            // nothing — non-blocking stdin may legitimately have no data
+        } else {
             long p = ftell(fp);
             if (p >= 0) pos = p;
             clearerr(fp);   // clear EOF so next fgets works
@@ -538,7 +581,8 @@ static vector<FuncStat> compute_hot_funcs(const ParseState& ps, int tid_filter,
 
 // ─── Draw: header ────────────────────────────────────────────────────────────
 
-static void draw_header(WINDOW* w, const UI& ui, const string& filename)
+static void draw_header(WINDOW* w, const UI& ui, const string& filename,
+                        const LiveReader* reader = nullptr)
 {
     int h, width; getmaxyx(w, h, width); (void)h;
     size_t leaks = 0, leak_bytes = 0;
@@ -547,16 +591,24 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename)
 
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
-    // Row 0: title + live indicator
+    // Row 0: title + live/TCP indicator
     if (ui.live) {
-        // Blinking green dot for live, dimmed when auto-follow is paused
         wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
-        if (ui.auto_follow)
+        bool disc = reader && reader->disconnected;
+        if (disc) {
+            // Grey/dim when disconnected (application has exited)
+            wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
+            mvwaddstr(w, 0, 0, " ✕ DONE ");
+            wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
+        } else if (ui.auto_follow) {
             wattron(w, COLOR_PAIR(C_ALLOC) | A_BOLD);
-        else
+            mvwaddstr(w, 0, 0, reader && reader->is_socket ? " ● TCP  " : " ● LIVE ");
+            wattroff(w, COLOR_PAIR(C_ALLOC) | A_BOLD);
+        } else {
             wattron(w, COLOR_PAIR(C_FREE)  | A_BOLD);
-        mvwaddstr(w, 0, 0, ui.auto_follow ? " ● LIVE " : " ◌ LIVE ");
-        wattroff(w, A_BOLD | COLOR_PAIR(C_ALLOC) | COLOR_PAIR(C_FREE));
+            mvwaddstr(w, 0, 0, reader && reader->is_socket ? " ◌ TCP  " : " ◌ LIVE ");
+            wattroff(w, COLOR_PAIR(C_FREE)  | A_BOLD);
+        }
         wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
         wprintw(w, " %s  │  %zu allocs  │  %zu shown",
                 filename.c_str(), ui.ps->records.size(), ui.visible.size());
@@ -923,7 +975,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         mvvline(2, lw, ACS_VLINE, body_height());
         attroff(COLOR_PAIR(C_DIM) | A_DIM);
         refresh();
-        draw_header(win.header, ui, filename);
+        draw_header(win.header, ui, filename, reader);
         draw_list(win.list, ui);
         draw_detail(win.detail, ui);
         draw_hotfn(win.hotfn, ui);
@@ -1120,6 +1172,23 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+// Parse "[host]:port" or ":port".  Returns true if the string looks like a
+// TCP address.  `host` defaults to "127.0.0.1" when omitted.
+static bool parse_tcp_addr(const string& s, string& host, int& port)
+{
+    // Must contain a colon separating host from port.
+    auto colon = s.rfind(':');
+    if (colon == string::npos) return false;
+    string port_str = s.substr(colon + 1);
+    if (port_str.empty()) return false;
+    for (char c : port_str) if (!isdigit((unsigned char)c)) return false;
+    port = atoi(port_str.c_str());
+    if (port <= 0 || port > 65535) return false;
+    host = s.substr(0, colon);
+    if (host.empty()) host = "127.0.0.1";
+    return true;
+}
+
 int main(int argc, char* argv[])
 {
     bool   live = false;
@@ -1133,21 +1202,45 @@ int main(int argc, char* argv[])
             dump_hotfn = true;
         else if (argv[i][0] != '-' || !strcmp(argv[i], "-"))
             path = argv[i];
+        else {
+            // Also accept ":port" as a positional argument even though it
+            // starts with '-' (the host part is empty → looks like a flag).
+            string h; int p;
+            if (parse_tcp_addr(argv[i], h, p))
+                path = argv[i];
+        }
     }
 
     if (path.empty()) {
         fprintf(stderr,
                 "Usage: %s [-f] <memtrack.log>\n"
                 "       %s [-f] -              (stdin)\n"
+                "       %s :PORT               (connect to memtrack TCP server, localhost)\n"
+                "       %s HOST:PORT           (connect to memtrack TCP server)\n"
                 "\n"
-                "  -f / --follow   Live mode: monitor file and update display as new\n"
-                "                  events are written.  Use F inside the viewer to\n"
-                "                  toggle auto-scroll.\n",
-                argv[0], argv[0]);
+                "  -f / --follow   Live file/stdin mode (TCP is always live).\n",
+                argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
-    // Initial parse of whatever is already in the file.
+    // ── TCP client mode ───────────────────────────────────────────────────────
+    string tcp_host; int tcp_port = 0;
+    if (parse_tcp_addr(path, tcp_host, tcp_port)) {
+        fprintf(stderr, "[memview] connecting to %s:%d ...\n",
+                tcp_host.c_str(), tcp_port);
+        LiveReader reader;
+        if (!reader.connect_tcp(tcp_host, tcp_port)) {
+            fprintf(stderr, "[memview] connection failed: %s\n", strerror(errno));
+            return 1;
+        }
+        fprintf(stderr, "[memview] connected\n");
+        ParseState ps;
+        live = true;
+        run(ps, path, live, &reader);
+        return 0;
+    }
+
+    // ── File / stdin mode ─────────────────────────────────────────────────────
     long initial_pos = 0;
     string real_path = (path == "-") ? "/dev/stdin" : path;
     ParseState ps = parse_file(real_path, &initial_pos);

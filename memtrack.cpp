@@ -18,6 +18,8 @@
 #include <cxxabi.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -88,9 +90,10 @@ static void log_free(void*, const char*); // forward declaration
 // Output fd and size filter  (MEMTRACK_OUTPUT / MEMTRACK_MIN_SIZE env vars)
 // Defined here so thread_exit_handler (below) can reference them.
 // ---------------------------------------------------------------------------
-static int    g_outfd       = STDERR_FILENO;
-static size_t g_min_size    = 0;
-static int    g_stack_depth = 0;   // 0 = stack traces disabled
+static int    g_outfd          = STDERR_FILENO;
+static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socket)
+static size_t g_min_size       = 0;
+static int    g_stack_depth    = 0;   // 0 = stack traces disabled
 
 // Monotonic start time – set in memtrack_ctor(); elapsed_us() returns
 // microseconds since then (0 for any allocation before the ctor runs).
@@ -294,6 +297,13 @@ static void atexit_handler()
     g_map->clear();
     pthread_mutex_unlock(&g_lock);
     in_hook = false;
+
+    // Closing the fd signals EOF to memview so it knows the application has
+    // finished.  Only close when we own the fd (file or TCP socket).
+    if (g_close_outfd && g_outfd != STDERR_FILENO) {
+        close(g_outfd);
+        g_outfd = STDERR_FILENO;
+    }
 }
 
 static void __attribute__((constructor)) memtrack_ctor()
@@ -302,17 +312,73 @@ static void __attribute__((constructor)) memtrack_ctor()
     pthread_key_create(&exit_key, thread_exit_handler);
     atexit(atexit_handler);
 
-    const char* out = getenv("MEMTRACK_OUTPUT");
-    if (out) {
-        int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd >= 0)
-            g_outfd = fd;
-        else {
-            const char msg[] = "[memtrack] WARNING: could not open output file, falling back to stderr\n";
-            write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    // ── TCP server mode (MEMTRACK_PORT) ──────────────────────────────────────
+    // Create a listening socket, print the port to stderr, then block until
+    // memview (or any client) connects.  This gives you time to attach the
+    // viewer before any allocations are recorded.
+    const char* port_env = getenv("MEMTRACK_PORT");
+    if (port_env) {
+        int port = atoi(port_env);
+        if (port > 0 && port <= 65535) {
+            int srv = socket(AF_INET, SOCK_STREAM, 0);
+            if (srv >= 0) {
+                int opt = 1;
+                setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+                struct sockaddr_in addr = {};
+                addr.sin_family      = AF_INET;
+                addr.sin_addr.s_addr = INADDR_ANY;
+                addr.sin_port        = htons((uint16_t)port);
+
+                char msg[128];
+                int  n;
+                if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
+                    listen(srv, 1) == 0) {
+                    n = snprintf(msg, sizeof(msg),
+                                 "[memtrack] TCP server on port %d — waiting for memview...\n",
+                                 port);
+                    write(STDERR_FILENO, msg, (size_t)n);
+
+                    int client = accept(srv, nullptr, nullptr);
+                    close(srv);
+                    // Remove MEMTRACK_PORT from the environment so that child
+                    // processes spawned after this point (e.g. bash sub-commands)
+                    // do NOT inherit it and try to start their own TCP server.
+                    unsetenv("MEMTRACK_PORT");
+                    if (client >= 0) {
+                        g_outfd        = client;
+                        g_close_outfd  = true;
+                        n = snprintf(msg, sizeof(msg),
+                                     "[memtrack] client connected, starting application\n");
+                        write(STDERR_FILENO, msg, (size_t)n);
+                    }
+                } else {
+                    close(srv);
+                    unsetenv("MEMTRACK_PORT");
+                    const char err[] = "[memtrack] WARNING: bind/listen failed, falling back to stderr\n";
+                    write(STDERR_FILENO, err, sizeof(err) - 1);
+                }
+            }
+            goto done_output;  // TCP takes priority over MEMTRACK_OUTPUT
         }
     }
 
+    // ── File output mode (MEMTRACK_OUTPUT) ───────────────────────────────────
+    {
+        const char* out = getenv("MEMTRACK_OUTPUT");
+        if (out) {
+            int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                g_outfd       = fd;
+                g_close_outfd = true;
+            } else {
+                const char msg[] = "[memtrack] WARNING: could not open output file, falling back to stderr\n";
+                write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            }
+        }
+    }
+
+    done_output:
     const char* min = getenv("MEMTRACK_MIN_SIZE");
     if (min) g_min_size = (size_t)strtoull(min, nullptr, 10);
 

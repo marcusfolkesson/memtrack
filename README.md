@@ -35,9 +35,24 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 
 | Variable               | Default       | Description |
 |------------------------|---------------|-------------|
-| `MEMTRACK_OUTPUT`      | _(stderr)_    | Write all output to this file instead of stderr. The file is created (or truncated) at startup. |
-| `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging and leak tracking for allocations smaller than this many bytes. The per-thread `total` counter still counts every allocation. |
-| `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile the application with `-rdynamic` for resolved symbol names. C++ symbols are automatically demangled. |
+| `MEMTRACK_PORT`        | _(none)_      | Start a TCP server on this port. The application **pauses at startup** until a client connects (e.g., `memview :PORT`). Output goes to the connected client instead of a file. Takes priority over `MEMTRACK_OUTPUT`. |
+| `MEMTRACK_OUTPUT`      | _(stderr)_    | Write all output to this file instead of stderr. Created/truncated at startup. |
+| `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
+| `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
+
+### TCP server mode
+
+```sh
+# Terminal 1 — start the target; it blocks until memview connects
+MEMTRACK_PORT=4242 MEMTRACK_STACK_DEPTH=8 LD_PRELOAD=./memtrack.so ./your_app
+
+# Terminal 2 — open the viewer; connects to the server and starts the app
+./memview :4242
+# or with an explicit host:
+./memview myhost:4242
+```
+
+The connection is closed automatically when the application exits, at which point memview shows `✕ DONE` in the header and continues displaying the collected data.
 
 ## Output format
 
