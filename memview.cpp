@@ -565,7 +565,7 @@ static void draw_list(WINDOW* w, const UI& ui)
         if (r.is_leak) attr |= A_BOLD;
 
         wattron(w, COLOR_PAIR(cp) | attr);
-        mvwprintw(w, row + 1, 0, " [%c] %-18s %-9s %-12s %-9s %-14s",
+        mvwprintw(w, row + 1, 0, " [%c] %-18s %-9s %-12s %-9s %-15s",
                   status, ptr_buf, r.op.c_str(),
                   fmt_time_ms(r.timestamp_us).c_str(),
                   sz.c_str(), r.thread_name.c_str());
@@ -728,16 +728,25 @@ struct Windows {
     WINDOW *header, *list, *detail, *status;
 };
 
+// Exact column width required for the list pane:
+//   " [X] " (5) + ptr "%-18s " (19) + op "%-9s " (10) +
+//   time "%-12s " (13) + size "%-9s " (10) + thread "%-15s" (15) = 72
+static constexpr int LIST_W = 72;
+
+// Actual list pane width — shrinks to half on very narrow terminals so the
+// detail pane always gets at least 30 columns.
+static int list_pane_w() { return (COLS >= LIST_W + 30) ? LIST_W : COLS / 2; }
+
 static Windows make_windows()
 {
     int rows = LINES, cols = COLS;
-    int mid   = cols / 2;
-    int body  = rows - 4;   // 2 header + 2 status
+    int lw   = list_pane_w();
+    int body = rows - 4;   // 2 header + 2 status
     return {
-        newwin(2,    cols,    0,   0),
-        newwin(body, mid,     2,   0),
-        newwin(body, cols-mid,2,   mid),
-        newwin(2,    cols,    rows-2, 0),
+        newwin(2,    cols,       0,      0),
+        newwin(body, lw,         2,      0),
+        newwin(body, cols-lw-1,  2,      lw+1),
+        newwin(2,    cols,       rows-2, 0),
     };
 }
 
@@ -770,9 +779,9 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
     Windows win = make_windows();
 
     auto redraw = [&]() {
-        int mid = COLS / 2;
+        int lw = list_pane_w();
         attron(COLOR_PAIR(C_DIM) | A_DIM);
-        mvvline(2, mid - 1, ACS_VLINE, LINES - 4);
+        mvvline(2, lw, ACS_VLINE, LINES - 4);
         attroff(COLOR_PAIR(C_DIM) | A_DIM);
         refresh();
         draw_header(win.header, ui, filename);
