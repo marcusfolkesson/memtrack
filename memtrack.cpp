@@ -118,6 +118,7 @@ static uint64_t elapsed_us()
 // ---------------------------------------------------------------------------
 struct AllocInfo {
     pid_t    tid;
+    char     name[16];          // thread name captured at allocation time
     size_t   size;
     char     op[12];
     uint64_t timestamp_us;  // microseconds since program start
@@ -138,6 +139,7 @@ static void map_record(void* ptr, size_t size, const char* op,
         g_map = new std::unordered_map<void*, AllocInfo>();
     AllocInfo info;
     info.tid          = (pid_t)syscall(SYS_gettid);
+    memcpy(info.name, get_thread_name(), sizeof(info.name)); // both buffers are 16 B
     info.size         = size;
     info.timestamp_us = ts;
     strncpy(info.op, op, sizeof(info.op) - 1);
@@ -220,10 +222,85 @@ static void thread_exit_handler(void*)
     in_hook = false;
 }
 
+// ---------------------------------------------------------------------------
+// atexit handler – catches any allocations missed by thread_exit_handler
+// ---------------------------------------------------------------------------
+//
+// pthread_key destructors fire when a *thread* exits.  When the *process*
+// exits via exit() or main() returning, glibc does not reliably call the
+// pthread_key destructor for the main thread.  As a result, any allocations
+// made by the main thread (or by threads still running at process exit) would
+// remain as "Active" in the viewer even though the application has finished.
+// This atexit handler sweeps whatever is still in g_map and reports it as
+// LEAK/SUMMARY, grouped by tid, so the viewer always shows a complete picture.
+
+static void atexit_handler()
+{
+    in_hook = true;
+    pthread_mutex_lock(&g_lock);
+
+    if (!g_map || g_map->empty()) {
+        pthread_mutex_unlock(&g_lock);
+        in_hook = false;
+        return;
+    }
+
+    char buf[256];
+    int  n;
+
+    // Collect the set of unique tids still in the map.
+    // We do this without extra heap allocation: iterate twice per tid.
+    // (The map is small at exit time so the extra passes are fine.)
+    pid_t seen[256];
+    int   seen_count = 0;
+    for (auto& [ptr, info] : *g_map) {
+        bool found = false;
+        for (int i = 0; i < seen_count; i++)
+            if (seen[i] == info.tid) { found = true; break; }
+        if (!found && seen_count < 256)
+            seen[seen_count++] = info.tid;
+    }
+
+    for (int si = 0; si < seen_count; si++) {
+        pid_t       tid        = seen[si];
+        const char* tname      = nullptr;
+        size_t      leak_count = 0;
+        size_t      leak_bytes = 0;
+
+        for (auto& [ptr, info] : *g_map) {
+            if (info.tid != tid) continue;
+            if (!tname) tname = info.name;
+            ++leak_count;
+            leak_bytes += info.size;
+            n = snprintf(buf, sizeof(buf),
+                         "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
+                         tid, info.name,
+                         (unsigned long long)info.timestamp_us,
+                         info.op, info.size, (void*)ptr);
+            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (info.frame_count > 0)
+                print_frames(info.frames, info.frame_count);
+        }
+
+        if (leak_count > 0) {
+            n = snprintf(buf, sizeof(buf),
+                         "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
+                         tid, tname ? tname : "?",
+                         leak_count, leak_bytes);
+            if (n > 0) write(g_outfd, buf, (size_t)n);
+        }
+    }
+
+    g_map->clear();
+    pthread_mutex_unlock(&g_lock);
+    in_hook = false;
+}
+
 static void __attribute__((constructor)) memtrack_ctor()
 {
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
     pthread_key_create(&exit_key, thread_exit_handler);
+    atexit(atexit_handler);
 
     const char* out = getenv("MEMTRACK_OUTPUT");
     if (out) {
@@ -446,8 +523,11 @@ void* realloc(void* old_ptr, size_t size)
     if (!real_realloc) resolve();
     if (in_hook) return real_realloc(old_ptr, size);
 
-    // Remove the old pointer before calling real_realloc: the old address
-    // becomes invalid regardless of whether the block is moved.
+    // The old pointer is implicitly freed by realloc.  Log the free event
+    // (so the viewer marks it as Freed, not Active) then remove from the map
+    // before calling real_realloc, since old_ptr becomes invalid regardless
+    // of whether the block is moved.
+    log_free(old_ptr, "free");
     map_remove(old_ptr);
 
     in_hook = true;
