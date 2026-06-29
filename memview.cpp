@@ -4,12 +4,15 @@
  * Build:  g++ -O2 -std=c++17 -o memview memview.cpp -lncurses
  * Usage:  ./memview <log>
  *         ./memview -              (read from stdin)
+ *         ./memview -f <log>       (live follow mode)
+ *         ./memview -f -           (live follow stdin)
  *
  * Keys:
  *   ↑ ↓  PgUp PgDn  Home End   Navigate allocation list
  *   Tab / ← →                  Switch focus: list ↔ detail pane
  *   f                           Cycle filter: All → Leaks → Active → Freed
  *   t                           Cycle thread filter
+ *   F                           Toggle auto-follow (live mode)
  *   q / Esc                     Quit
  */
 
@@ -18,14 +21,15 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
-#include <algorithm>
 #include <fstream>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cinttypes>
-
 #include <climits>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 
 using std::vector;
 using std::string;
@@ -222,14 +226,111 @@ static void parse_line(const char* line, ParseState& st)
     }
 }
 
-static ParseState parse_file(const string& path)
+static ParseState parse_file(const string& path, long* out_pos = nullptr)
 {
     ParseState st;
-    std::ifstream f(path);
-    string line;
-    while (std::getline(f, line)) parse_line(line.c_str(), st);
+    FILE* fp = fopen(path.c_str(), "r");
+    if (!fp) {
+        if (out_pos) *out_pos = 0;
+        return st;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+        parse_line(line, st);
+    }
+    if (out_pos) *out_pos = ftell(fp);
+    fclose(fp);
     return st;
 }
+
+// ─── Live reader ─────────────────────────────────────────────────────────────
+//
+// Opened once after the initial parse; poll_new() appends any newly written
+// lines to the ParseState.  Detects file truncation (application restarted)
+// and signals the UI to clear and rebuild from scratch.
+
+struct LiveReader {
+    string path;
+    FILE*  fp       = nullptr;
+    long   pos      = 0;
+    bool   is_stdin = false;
+
+    // `initial_pos` is the byte offset after the initial parse so we don't
+    // re-process already-seen lines.
+    void open(const string& p, long initial_pos = 0)
+    {
+        path     = p;
+        is_stdin = (p == "-" || p == "/dev/stdin");
+
+        if (is_stdin) {
+            fp  = stdin;
+            pos = 0;
+            // Make stdin non-blocking so poll_new() can return quickly.
+            int flags = fcntl(fileno(stdin), F_GETFL, 0);
+            fcntl(fileno(stdin), F_SETFL, flags | O_NONBLOCK);
+        } else {
+            fp  = fopen(p.c_str(), "r");
+            pos = initial_pos;
+            if (fp) fseek(fp, pos, SEEK_SET);
+        }
+    }
+
+    // Read any newly appended lines into `st`.
+    // Returns true if the file was truncated (application restarted) — the
+    // caller should treat this as a full reset of the display.
+    // `new_count` is set to the number of new lines parsed this call.
+    bool poll_new(ParseState& st, int& new_count)
+    {
+        new_count = 0;
+
+        if (!fp && !is_stdin) {
+            // File may not have appeared yet — try again next poll.
+            fp = fopen(path.c_str(), "r");
+            if (!fp) return false;
+            pos = 0;
+        }
+
+        if (!is_stdin) {
+            // Detect truncation: current end is before our read position.
+            long saved = ftell(fp);
+            fseek(fp, 0, SEEK_END);
+            long cur_end = ftell(fp);
+            fseek(fp, saved, SEEK_SET);
+
+            if (cur_end < pos) {
+                // File was truncated — clear state and restart from top.
+                st  = ParseState{};
+                pos = 0;
+                fseek(fp, 0, SEEK_SET);
+                clearerr(fp);
+                return true;   // signal: UI should reset
+            }
+            if (cur_end == pos) return false;  // nothing new
+        } else {
+            // Non-blocking stdin: check readability with poll.
+            struct pollfd pfd = { fileno(stdin), POLLIN, 0 };
+            if (::poll(&pfd, 1, 0) <= 0) return false;
+        }
+
+        char line_buf[4096];
+        while (fgets(line_buf, sizeof(line_buf), fp)) {
+            size_t len = strlen(line_buf);
+            if (len > 0 && line_buf[len - 1] == '\n') line_buf[len - 1] = '\0';
+            parse_line(line_buf, st);
+            new_count++;
+        }
+
+        if (!is_stdin) {
+            long p = ftell(fp);
+            if (p >= 0) pos = p;
+            clearerr(fp);   // clear EOF so next fgets works
+        }
+
+        return false;
+    }
+};
 
 // ─── Colour pairs ────────────────────────────────────────────────────────────
 
@@ -267,18 +368,22 @@ enum SortMode  { S_TIME, S_SIZE, S_THREAD, S_COUNT };
 static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
 struct UI {
-    const ParseState* ps          = nullptr;
-    vector<size_t>    visible;        // indices into ps->records
-    FilterMode        filter        = F_ALL;
-    int               tid_filter    = -1;   // -1 = all threads
-    SortMode          sort          = S_TIME;
-    bool              sort_rev      = false;
-    int               selected      = 0;    // index into visible[]
-    int               list_top      = 0;    // scroll offset in list pane
-    int               detail_top    = 0;    // scroll offset in detail pane
-    bool              focus_detail  = false;
+    ParseState*    ps           = nullptr;
+    vector<size_t> visible;        // indices into ps->records
+    FilterMode     filter        = F_ALL;
+    int            tid_filter    = -1;   // -1 = all threads
+    SortMode       sort          = S_TIME;
+    bool           sort_rev      = false;
+    int            selected      = 0;    // index into visible[]
+    int            list_top      = 0;    // scroll offset in list pane
+    int            detail_top    = 0;    // scroll offset in detail pane
+    bool           focus_detail  = false;
+    bool           live          = false;
+    bool           auto_follow   = true; // scroll to newest in live mode
 
-    void rebuild()
+    // reset_scroll=true: reset selection and scroll (filter changes, full reset).
+    // reset_scroll=false: preserve selection and scroll (incremental data update).
+    void rebuild(bool reset_scroll = true)
     {
         visible.clear();
         for (size_t i = 0; i < ps->records.size(); i++) {
@@ -315,10 +420,14 @@ struct UI {
         };
         std::stable_sort(visible.begin(), visible.end(), cmp);
 
-        selected   = min(selected, (int)visible.size() - 1);
-        if (selected < 0) selected = 0;
-        list_top   = 0;
-        detail_top = 0;
+        if (reset_scroll) {
+            selected   = 0;
+            list_top   = 0;
+            detail_top = 0;
+        } else {
+            selected = min(selected, (int)visible.size() - 1);
+            if (selected < 0) selected = 0;
+        }
     }
 
     const AllocRecord* current() const {
@@ -371,9 +480,27 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename)
         if (!r.freed || r.is_leak) { leaks++; leak_bytes += r.size; }
 
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
-    mvwprintw(w, 0, 0, " memtrack viewer  %s  │  %zu allocs  │  %zu shown",
-              filename.c_str(), ui.ps->records.size(), ui.visible.size());
+
+    // Row 0: title + live indicator
+    if (ui.live) {
+        // Blinking green dot for live, dimmed when auto-follow is paused
+        wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+        if (ui.auto_follow)
+            wattron(w, COLOR_PAIR(C_ALLOC) | A_BOLD);
+        else
+            wattron(w, COLOR_PAIR(C_FREE)  | A_BOLD);
+        mvwaddstr(w, 0, 0, ui.auto_follow ? " ● LIVE " : " ◌ LIVE ");
+        wattroff(w, A_BOLD | COLOR_PAIR(C_ALLOC) | COLOR_PAIR(C_FREE));
+        wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+        wprintw(w, " %s  │  %zu allocs  │  %zu shown",
+                filename.c_str(), ui.ps->records.size(), ui.visible.size());
+    } else {
+        mvwprintw(w, 0, 0, " memtrack viewer  %s  │  %zu allocs  │  %zu shown",
+                  filename.c_str(), ui.ps->records.size(), ui.visible.size());
+    }
     hline_to_eol(w, 0, C_HEADER);
+
+    // Row 1: filter/sort/leak summary
     mvwprintw(w, 1, 0, " Filter: %-8s │  Thread: %-15s │  Sort: %s%s │  Leaks: %zu  (%s)",
               filter_label[ui.filter],
               ui.tid_filter == -1 ? "all" : [&]() -> string {
@@ -384,6 +511,9 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename)
               sort_label[ui.sort],
               ui.sort_rev ? " ▲" : " ▼",
               leaks, fmt_size(leak_bytes).c_str());
+    if (ui.live) {
+        wprintw(w, "  │  Follow: %s", ui.auto_follow ? "ON [F]" : "OFF[F]");
+    }
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
     wrefresh(w);
@@ -584,7 +714,8 @@ static void draw_status(WINDOW* w, const UI& ui)
     // Key hints
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
     mvwprintw(w, 1, 0,
-              " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot");
+              " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot%s",
+              ui.live ? "  F:follow" : "");
     hline_to_eol(w, 1, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
 
@@ -618,10 +749,11 @@ static void free_windows(Windows& w)
 
 // ─── Main UI loop ────────────────────────────────────────────────────────────
 
-static void run(const ParseState& ps, const string& filename)
+static void run(ParseState& ps, const string& filename, bool live, LiveReader* reader)
 {
     UI ui;
-    ui.ps = &ps;
+    ui.ps   = &ps;
+    ui.live = live;
     ui.rebuild();
 
     initscr();
@@ -632,10 +764,12 @@ static void run(const ParseState& ps, const string& filename)
     set_escdelay(50);
     init_colors();
 
+    // In live mode use a 250 ms input timeout so we can poll for new data.
+    if (live) wtimeout(stdscr, 250);
+
     Windows win = make_windows();
 
     auto redraw = [&]() {
-        // Vertical divider on stdscr
         int mid = COLS / 2;
         attron(COLOR_PAIR(C_DIM) | A_DIM);
         mvvline(2, mid - 1, ACS_VLINE, LINES - 4);
@@ -647,10 +781,43 @@ static void run(const ParseState& ps, const string& filename)
         draw_status(win.status, ui);
     };
 
+    // Helper: scroll list so `selected` is visible.
+    auto ensure_visible = [&]() {
+        int h, w2; getmaxyx(win.list, h, w2); (void)w2;
+        int page = h - 2;
+        if (ui.selected < ui.list_top)
+            ui.list_top = ui.selected;
+        if (ui.selected >= ui.list_top + page)
+            ui.list_top = ui.selected - page + 1;
+        if (ui.list_top < 0) ui.list_top = 0;
+    };
+
     redraw();
 
     while (true) {
         int ch = wgetch(stdscr);
+
+        // ── Live polling ─────────────────────────────────────────────────
+        if (ch == ERR && live && reader) {
+            int   new_lines = 0;
+            bool  reset     = reader->poll_new(ps, new_lines);
+
+            if (reset) {
+                // Application restarted — full UI reset.
+                ui.rebuild(true);
+                redraw();
+            } else if (new_lines > 0) {
+                int prev_vis = (int)ui.visible.size();
+                ui.rebuild(false);   // keep scroll position
+
+                if (ui.auto_follow && (int)ui.visible.size() > prev_vis) {
+                    ui.selected = max(0, (int)ui.visible.size() - 1);
+                    ensure_visible();
+                }
+                redraw();
+            }
+            continue;
+        }
 
         if (ch == 'q' || ch == 27) break;
 
@@ -671,6 +838,13 @@ static void run(const ParseState& ps, const string& filename)
             continue;
         }
 
+        // Toggle auto-follow (live mode only)
+        if (ch == 'F' && live) {
+            ui.auto_follow = !ui.auto_follow;
+            redraw();
+            continue;
+        }
+
         if (!ui.focus_detail) {
             // ── List navigation ──────────────────────────────────────────
             int h, w2; getmaxyx(win.list, h, w2); (void)w2;
@@ -679,31 +853,38 @@ static void run(const ParseState& ps, const string& filename)
             if ((ch == KEY_UP || ch == 'k') && ui.selected > 0) {
                 ui.selected--;
                 ui.detail_top = 0;
-                if (ui.selected < ui.list_top) ui.list_top = ui.selected;
+                // Manual navigation disables auto-follow so the view doesn't
+                // jump away while the user is browsing.
+                if (live) ui.auto_follow = false;
+                ensure_visible();
             } else if ((ch == KEY_DOWN || ch == 'j') && ui.selected < (int)ui.visible.size()-1) {
                 ui.selected++;
                 ui.detail_top = 0;
-                if (ui.selected >= ui.list_top + page)
-                    ui.list_top = ui.selected - page + 1;
+                if (live) ui.auto_follow = false;
+                ensure_visible();
             } else if (ch == KEY_PPAGE || ch == ctrl('b')) {
                 ui.selected = max(0, ui.selected - page);
                 ui.list_top = max(0, ui.list_top - page);
                 ui.detail_top = 0;
+                if (live) ui.auto_follow = false;
             } else if (ch == KEY_NPAGE || ch == ctrl('f')) {
                 ui.selected = min((int)ui.visible.size()-1, ui.selected + page);
                 ui.list_top = min(max(0,(int)ui.visible.size()-page), ui.list_top+page);
                 ui.detail_top = 0;
+                if (live) ui.auto_follow = false;
             } else if (ch == KEY_HOME || ch == 'g') {
                 ui.selected = 0; ui.list_top = 0; ui.detail_top = 0;
+                if (live) ui.auto_follow = false;
             } else if (ch == KEY_END || ch == 'G') {
                 ui.selected = max(0, (int)ui.visible.size()-1);
                 ui.list_top = max(0, ui.selected - page + 1);
                 ui.detail_top = 0;
+                // G = jump to bottom → re-enable auto-follow
+                if (live) ui.auto_follow = true;
             } else if (ch == 'f') {
                 ui.filter = (FilterMode)((ui.filter + 1) % F_COUNT);
                 ui.rebuild();
             } else if (ch == 's') {
-                // Cycle sort mode; hitting the same key again reverses direction
                 SortMode next = (SortMode)((ui.sort + 1) % S_COUNT);
                 if (next == ui.sort)
                     ui.sort_rev = !ui.sort_rev;
@@ -766,22 +947,44 @@ static void run(const ParseState& ps, const string& filename)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <memtrack.log>\n"
-                        "       %s -              (stdin)\n", argv[0], argv[0]);
+    bool   live = false;
+    string path;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--follow"))
+            live = true;
+        else if (argv[i][0] != '-' || !strcmp(argv[i], "-"))
+            path = argv[i];
+    }
+
+    if (path.empty()) {
+        fprintf(stderr,
+                "Usage: %s [-f] <memtrack.log>\n"
+                "       %s [-f] -              (stdin)\n"
+                "\n"
+                "  -f / --follow   Live mode: monitor file and update display as new\n"
+                "                  events are written.  Use F inside the viewer to\n"
+                "                  toggle auto-scroll.\n",
+                argv[0], argv[0]);
         return 1;
     }
 
-    string path = (strcmp(argv[1], "-") == 0) ? "/dev/stdin" : argv[1];
-    ParseState ps = parse_file(path);
+    // Initial parse of whatever is already in the file.
+    long initial_pos = 0;
+    string real_path = (path == "-") ? "/dev/stdin" : path;
+    ParseState ps = parse_file(real_path, &initial_pos);
 
-    if (ps.records.empty()) {
+    if (!live && ps.records.empty()) {
         fprintf(stderr, "No memtrack records found in '%s'.\n"
                         "Make sure MEMTRACK_MIN_SIZE is not filtering everything out.\n",
-                argv[1]);
+                path.c_str());
         return 1;
     }
 
-    run(ps, argv[1]);
+    // In live mode, open the reader from where the initial parse left off.
+    LiveReader reader;
+    if (live) reader.open(real_path, initial_pos);
+
+    run(ps, path, live, live ? &reader : nullptr);
     return 0;
 }
