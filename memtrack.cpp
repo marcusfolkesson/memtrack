@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <execinfo.h>
+#include <cxxabi.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <stdio.h>
@@ -245,14 +246,55 @@ static const char* get_thread_name()
 // Print symbolised stack frames.  Must be called with in_hook == true.
 // backtrace_symbols() allocates internally; real_free() is used to release it
 // so the freed buffer (which was never tracked) doesn't confuse map_remove.
+//
+// Each symbol string from backtrace_symbols looks like one of:
+//   ./binary(mangled_name+0xNN) [0xADDR]   — Linux with -rdynamic
+//   ./binary(+0xoffset) [0xADDR]            — no symbol
+//   /lib/libc.so.6(func+0xNN) [0xADDR]
+//
+// We extract the mangled name (between '(' and '+'/')'), demangle it with
+// __cxa_demangle, and reconstruct the string.
 static void print_frames(void** frames, int count)
 {
     char** syms = backtrace_symbols(frames, count);
     if (!syms) return;
-    char buf[512];
+
+    char buf[1024];
     for (int i = 0; i < count; i++) {
-        int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, syms[i]);
-        if (n > 0) write(g_outfd, buf, (size_t)n);
+        const char* sym = syms[i];
+
+        // Locate the mangled symbol between '(' and the first '+' or ')'
+        const char* lparen = strchr(sym, '(');
+        const char* plus   = lparen ? strpbrk(lparen, "+)") : nullptr;
+
+        if (lparen && plus && plus > lparen + 1) {
+            // Extract module (everything before '(')
+            int mod_len = (int)(lparen - sym);
+
+            // Extract mangled name
+            int  name_len  = (int)(plus - lparen - 1);
+            char mangled[512];
+            if (name_len >= (int)sizeof(mangled)) name_len = (int)sizeof(mangled) - 1;
+            memcpy(mangled, lparen + 1, (size_t)name_len);
+            mangled[name_len] = '\0';
+
+            // Demangle — __cxa_demangle allocates with malloc; release with real_free
+            int   status   = -1;
+            char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+            const char* display = (status == 0 && demangled) ? demangled : mangled;
+
+            // Remainder: "+0xNN) [0xADDR]"
+            const char* rest = plus;
+
+            int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
+                             i, mod_len, sym, display, rest);
+            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (demangled) real_free(demangled);
+        } else {
+            // Fallback: print as-is
+            int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, sym);
+            if (n > 0) write(g_outfd, buf, (size_t)n);
+        }
     }
     real_free(syms);
 }
