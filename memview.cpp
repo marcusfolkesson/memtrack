@@ -352,13 +352,15 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename)
     mvwprintw(w, 0, 0, " memtrack viewer  %s  │  %zu allocs  │  %zu shown",
               filename.c_str(), ui.ps->records.size(), ui.visible.size());
     hline_to_eol(w, 0, C_HEADER);
-    mvwprintw(w, 1, 0, " Filter: %-8s │  Thread: %-15s │  Leaks: %zu  (%s)",
+    mvwprintw(w, 1, 0, " Filter: %-8s │  Thread: %-15s │  Sort: %s%s │  Leaks: %zu  (%s)",
               filter_label[ui.filter],
               ui.tid_filter == -1 ? "all" : [&]() -> string {
                   for (auto& t : ui.ps->threads)
                       if (t.tid == ui.tid_filter) return t.name;
                   return "?";
               }().c_str(),
+              sort_label[ui.sort],
+              ui.sort_rev ? " ▲" : " ▼",
               leaks, fmt_size(leak_bytes).c_str());
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
@@ -372,10 +374,21 @@ static void draw_list(WINDOW* w, const UI& ui)
     int rows, cols; getmaxyx(w, rows, cols);
     werase(w);
 
-    // Sub-header
+    // Sub-header — underline active sort column
+    werase(w);
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
-    mvwprintw(w, 0, 0, " %-3s %-18s %-9s %-9s %-14s",
-              "St.", "Pointer", "Op", "Size", "Thread");
+    mvwaddstr(w, 0, 0, " St. ");
+    waddstr(w, "Pointer            ");
+
+    auto col = [&](const char* label, SortMode sm) {
+        if (ui.sort == sm) wattron(w, A_UNDERLINE);
+        waddstr(w, label);
+        if (ui.sort == sm) wattroff(w, A_UNDERLINE);
+    };
+    col("Op         ", S_TIME);    // Op column — sort by time (insertion order)
+    col("Size       ", S_SIZE);
+    col("Thread",      S_THREAD);
+
     hline_to_eol(w, 0, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
@@ -543,7 +556,7 @@ static void draw_status(WINDOW* w, const UI& ui)
     // Key hints
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
     mvwprintw(w, 1, 0,
-              " q:quit  f:filter  t:thread  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot");
+              " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot");
     hline_to_eol(w, 1, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
 
@@ -661,6 +674,28 @@ static void run(const ParseState& ps, const string& filename)
             } else if (ch == 'f') {
                 ui.filter = (FilterMode)((ui.filter + 1) % F_COUNT);
                 ui.rebuild();
+            } else if (ch == 's') {
+                // Cycle sort mode; hitting the same key again reverses direction
+                SortMode next = (SortMode)((ui.sort + 1) % S_COUNT);
+                if (next == ui.sort)
+                    ui.sort_rev = !ui.sort_rev;
+                else {
+                    ui.sort_rev = false;
+                    ui.sort = next;
+                }
+                ui.rebuild();
+            } else if (ch == 'S') {
+                ui.sort_rev = !ui.sort_rev;
+                ui.rebuild();
+            } else if (ch == '1') {
+                ui.sort_rev = (ui.sort == S_TIME) ? !ui.sort_rev : false;
+                ui.sort = S_TIME; ui.rebuild();
+            } else if (ch == '2') {
+                ui.sort_rev = (ui.sort == S_SIZE) ? !ui.sort_rev : false;
+                ui.sort = S_SIZE; ui.rebuild();
+            } else if (ch == '3') {
+                ui.sort_rev = (ui.sort == S_THREAD) ? !ui.sort_rev : false;
+                ui.sort = S_THREAD; ui.rebuild();
             } else if (ch == 't') {
                 if (ps.threads.empty()) goto next_draw;
                 if (ui.tid_filter == -1) {

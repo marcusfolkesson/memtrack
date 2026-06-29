@@ -134,11 +134,15 @@ LD_PRELOAD=./memtrack.so ./your_app 2>&1 | tee run.log | ./memview -
 
 | Key | Action |
 |-----|--------|
-| `↑` `↓` | Navigate allocation list (or scroll detail pane when focused) |
-| `PgUp` `PgDn` `Home` `End` | Scroll list or detail |
-| `Tab` / `←` `→` | Switch focus between list and detail pane |
+| `↑` `↓` / `k` `j` | Navigate allocation list (or scroll detail pane when focused) |
+| `PgUp` `PgDn` / `Ctrl-b` `Ctrl-f` | Scroll list or detail by page |
+| `Home` `End` / `g` `G` | Jump to top / bottom |
+| `Tab` / `←` `→` / `h` `l` | Switch focus between list and detail pane |
 | `f` | Cycle filter: **All → Leaks → Active → Freed** |
 | `t` | Cycle thread filter |
+| `s` | Cycle sort: **Time → Size → Thread** (press again to reverse) |
+| `S` | Reverse current sort direction |
+| `1` / `2` / `3` | Sort by Time / Size / Thread directly (toggles reverse if already active) |
 | `q` / `Esc` | Quit |
 
 
