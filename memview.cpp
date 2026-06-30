@@ -457,6 +457,7 @@ struct UI {
     int            hotfn_top    = 0;    // scroll offset in hot-fn pane
     bool           live          = false;
     bool           auto_follow   = true; // scroll to newest in live mode
+    bool           resolve_lines = false; // show addr2line source locations
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -678,9 +679,127 @@ static void draw_list(WINDOW* w, const UI& ui)
 
 // ─── Draw: detail pane (right) ───────────────────────────────────────────────
 
+// addr2line resolver — calls addr2line once per (module, addr) pair and caches
+// the result.  Returns "filename:line" or "" if not resolvable.
+// Handles both non-PIE (use raw addr) and PIE (resolve via nm symbol + offset).
+static const string& resolve_addr2line(const string& frame)
+{
+    static unordered_map<string, string> cache;
+    static unordered_map<string, unordered_map<string, uint64_t>> nm_cache; // module → sym → addr
+
+    auto cached = cache.find(frame);
+    if (cached != cache.end()) return cached->second;
+
+    string& result = cache[frame];  // default-insert as ""
+
+    // Parse "module(func+offset) [0xADDR]"
+    auto lbr = frame.rfind('[');
+    auto rbr = frame.rfind(']');
+    auto lp  = frame.find('(');
+    auto rp  = frame.find(')');
+    if (lbr == string::npos || rbr == string::npos || lp == string::npos)
+        return result;
+
+    string module   = frame.substr(0, lp);
+    string sym_part = (rp != string::npos && rp > lp) ? frame.substr(lp+1, rp-lp-1) : "";
+    string rt_addr  = frame.substr(lbr + 1, rbr - lbr - 1);
+    if (module.empty() || rt_addr.empty() || rt_addr == "??") return result;
+
+    // Determine the address to pass addr2line.
+    // For non-PIE: runtime addr == file addr — subtract 1 for return-address correction.
+    // For PIE: runtime addr is ASLR-shifted.  Recover file addr via:
+    //   sym_part = "funcname+0xOFFSET" → look up funcname in nm, add offset - 1.
+    // The -1 is needed because backtrace() records the return address (instruction
+    // after CALL), and we want to point inside the CALL for correct source mapping.
+    string resolve_addr;
+    {
+        uint64_t raw = 0;
+        try { raw = stoull(rt_addr, nullptr, 16); } catch (...) {}
+        if (raw > 0) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "0x%lx", raw - 1);
+            resolve_addr = buf;
+        } else {
+            resolve_addr = rt_addr;
+        }
+    }
+
+    auto plus = sym_part.rfind('+');
+    if (plus != string::npos) {
+        string sym    = sym_part.substr(0, plus);
+        string offstr = sym_part.substr(plus + 1);  // "0xNN"
+        uint64_t offset = 0;
+        try { offset = stoull(offstr, nullptr, 16); } catch (...) {}
+
+        if (!sym.empty() && !nm_cache.count(module)) {
+            // Populate nm symbol table for this module
+            unordered_map<string, uint64_t> syms;
+            string nm_cmd = "nm -D " + module + " 2>/dev/null; nm " + module + " 2>/dev/null";
+            FILE* nfp = popen(nm_cmd.c_str(), "r");
+            if (nfp) {
+                char buf[512];
+                while (fgets(buf, sizeof(buf), nfp)) {
+                    uint64_t a = 0; char t = 0; char n[256] = {};
+                    if (sscanf(buf, "%lx %c %255s", &a, &t, n) == 3 && a != 0)
+                        syms.emplace(n, a);
+                }
+                pclose(nfp);
+            }
+            nm_cache[module] = std::move(syms);
+        }
+
+        auto& syms = nm_cache[module];
+        auto sit = syms.find(sym);
+        if (sit != syms.end()) {
+            char buf[32];
+            // Subtract 1: backtrace gives the return address (instruction after
+            // the call), so -1 puts us inside the CALL instruction itself,
+            // which addr2line maps to the correct calling source line.
+            snprintf(buf, sizeof(buf), "0x%lx", sit->second + offset - 1);
+            resolve_addr = buf;
+        }
+    }
+
+    // addr2line -e <module> -f -s -C -i <addr>
+    string cmd = "addr2line -e " + module + " -f -s -C -i " + resolve_addr + " 2>/dev/null";
+    FILE* fp = popen(cmd.c_str(), "r");
+    if (!fp) return result;
+
+    char buf[512];
+    bool want_fileline = false;  // addr2line alternates: funcname, file:line, ...
+    while (fgets(buf, sizeof(buf), fp)) {
+        string line = buf;
+        if (!line.empty() && line.back() == '\n') line.pop_back();
+        if (want_fileline) {
+            if (line != "??:0" && line != "??:?" && line != ":?") {
+                if (!result.empty()) result += " → ";
+                result += line;
+            }
+        }
+        want_fileline = !want_fileline;
+    }
+    pclose(fp);
+    return result;
+}
+
 struct DLine { string text; int cp; int attr; };
 
-static vector<DLine> build_detail(const AllocRecord& r)
+static void add_frames(vector<DLine>& d, const vector<string>& frames, bool resolve)
+{
+    auto add = [&](string t, int cp = C_NORMAL, int attr = 0) {
+        d.push_back({std::move(t), cp, attr});
+    };
+    for (int i = 0; i < (int)frames.size(); i++) {
+        add("    #" + std::to_string(i) + "  " + frames[i], C_DIM, A_DIM);
+        if (resolve) {
+            const string& loc = resolve_addr2line(frames[i]);
+            if (!loc.empty())
+                add("         → " + loc, C_ALLOC, 0);
+        }
+    }
+}
+
+static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines)
 {
     vector<DLine> d;
     auto add = [&](string t, int cp = C_NORMAL, int attr = 0) {
@@ -705,8 +824,7 @@ static vector<DLine> build_detail(const AllocRecord& r)
     if (!r.frames.empty()) {
         add("");
         add("  Stack:", C_DIM, A_DIM);
-        for (int i = 0; i < (int)r.frames.size(); i++)
-            add("    #" + std::to_string(i) + "  " + r.frames[i], C_DIM, A_DIM);
+        add_frames(d, r.frames, resolve_lines);
     }
 
     add("");
@@ -724,8 +842,7 @@ static vector<DLine> build_detail(const AllocRecord& r)
         if (!r.free_frames.empty()) {
             add("");
             add("  Stack:", C_DIM, A_DIM);
-            for (int i = 0; i < (int)r.free_frames.size(); i++)
-                add("    #" + std::to_string(i) + "  " + r.free_frames[i], C_DIM, A_DIM);
+            add_frames(d, r.free_frames, resolve_lines);
         }
     }
     return d;
@@ -739,7 +856,9 @@ static void draw_detail(WINDOW* w, const UI& ui)
     // Sub-header
     bool focused = ui.focus_detail && !ui.focus_hotfn;
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
-    mvwprintw(w, 0, 0, " Detail%s", focused ? " [↑↓ scroll]" : "");
+    mvwprintw(w, 0, 0, " Detail%s%s",
+              focused ? " [↑↓ scroll]" : "",
+              ui.resolve_lines ? " [L:src ON]" : " [L:src off]");
     hline_to_eol(w, 0, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
@@ -752,7 +871,7 @@ static void draw_detail(WINDOW* w, const UI& ui)
         return;
     }
 
-    auto detail  = build_detail(*r);
+    auto detail  = build_detail(*r, ui.resolve_lines);
     int  visible = rows - 2;    // -1 header -1 scrollbar
 
     for (int row = 0; row < visible; row++) {
@@ -809,7 +928,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 1, 0,
-                  " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot%s",
+                  " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 1, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1067,6 +1186,13 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             ui.auto_follow = !ui.auto_follow;
             redraw();
             continue;
+        }
+
+        // Toggle addr2line source-line resolution in the detail pane.
+        if (ch == 'L') {
+            ui.resolve_lines = !ui.resolve_lines;
+            ui.detail_top    = 0;
+            goto next_draw;
         }
 
         // Thread filter — works regardless of which pane has focus.
