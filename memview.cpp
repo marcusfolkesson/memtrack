@@ -190,6 +190,9 @@ static void parse_line(const char* line, ParseState& st)
         sscanf(after, "%*s ts=%llu size=%zu total=%zu ptr=%p", &ts_ull, &sz, &total, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
+        // Register the thread so 't' (thread filter) works before the thread exits.
+        st.thread(tid, tname);
+
         AllocRecord rec;
         rec.ptr          = ptr;
         rec.tid          = tid;
@@ -214,6 +217,9 @@ static void parse_line(const char* line, ParseState& st)
         unsigned long long ts_ull = 0;
         sscanf(after, "%*s ts=%llu size=%zu ptr=%p", &ts_ull, &sz, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
+
+        // Register the thread so 't' works before the thread exits.
+        st.thread(tid, tname);
 
         auto it = st.ptr_idx.find(ptr);
         if (it != st.ptr_idx.end()) {
@@ -353,7 +359,11 @@ struct LiveReader {
         }
 
         char line_buf[4096];
-        while (fgets(line_buf, sizeof(line_buf), fp)) {
+        // Limit lines per poll so fast streams don't starve keyboard input.
+        // The caller will immediately call poll_new again on the next tick.
+        static constexpr int MAX_LINES_PER_POLL = 500;
+        int limit = MAX_LINES_PER_POLL;
+        while (limit-- > 0 && fgets(line_buf, sizeof(line_buf), fp)) {
             size_t len = strlen(line_buf);
             if (len > 0 && line_buf[len - 1] == '\n') line_buf[len - 1] = '\0';
             parse_line(line_buf, st);
@@ -410,6 +420,9 @@ static const char* filter_label[] = { "All", "Leaks", "Active", "Freed" };
 enum SortMode  { S_TIME, S_SIZE, S_THREAD, S_COUNT };
 static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
+// Forward declaration — full definition appears below, after the helpers it uses.
+struct FuncStat;
+
 struct UI {
     ParseState*    ps           = nullptr;
     vector<size_t> visible;        // indices into ps->records
@@ -425,6 +438,11 @@ struct UI {
     int            hotfn_top    = 0;    // scroll offset in hot-fn pane
     bool           live          = false;
     bool           auto_follow   = true; // scroll to newest in live mode
+
+    // Cached hot-function list — recomputed only after rebuild().
+    mutable vector<FuncStat> hotfn_cache;
+    mutable size_t  hotfn_cache_rec_count = SIZE_MAX; // ps->records.size() at cache time
+    mutable int     hotfn_cache_tid = -2; // tid_filter at cache time (-2 = invalid)
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -474,7 +492,13 @@ struct UI {
             selected = min(selected, (int)visible.size() - 1);
             if (selected < 0) selected = 0;
         }
+
+        // Invalidate hot-function cache whenever data or filter changes.
+        hotfn_cache_rec_count = SIZE_MAX;
     }
+
+    // Return cached hot functions, recomputing only when needed.
+    const vector<FuncStat>& hot_funcs() const;
 
     const AllocRecord* current() const {
         if (visible.empty()) return nullptr;
@@ -577,6 +601,18 @@ static vector<FuncStat> compute_hot_funcs(const ParseState& ps, int tid_filter,
 
     if ((int)result.size() > top_n) result.resize((size_t)top_n);
     return result;
+}
+
+// UI::hot_funcs() — defined here so compute_hot_funcs is in scope.
+const vector<FuncStat>& UI::hot_funcs() const
+{
+    if (hotfn_cache_rec_count != ps->records.size() ||
+        hotfn_cache_tid       != tid_filter) {
+        hotfn_cache           = compute_hot_funcs(*ps, tid_filter, INT_MAX);
+        hotfn_cache_rec_count = ps->records.size();
+        hotfn_cache_tid       = tid_filter;
+    }
+    return hotfn_cache;
 }
 
 // ─── Draw: header ────────────────────────────────────────────────────────────
@@ -854,7 +890,7 @@ static void draw_hotfn(WINDOW* w, const UI& ui)
     bool focused = ui.focus_hotfn;
 
     // Compute ALL functions (no top_n cap) — sorted by net unfreed bytes desc.
-    auto funcs = compute_hot_funcs(*ui.ps, ui.tid_filter, INT_MAX);
+    const auto& funcs = ui.hot_funcs();
     int  total  = (int)funcs.size();
     int  page   = rows - 2;          // visible data rows
 
@@ -964,8 +1000,9 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
     set_escdelay(50);
     init_colors();
 
-    // In live mode use a 250 ms input timeout so we can poll for new data.
-    if (live) wtimeout(stdscr, 250);
+    // In live mode use a 50 ms input timeout so we can poll for new data
+    // without starving keyboard input.
+    if (live) wtimeout(stdscr, 50);
 
     Windows win = make_windows();
 
@@ -1060,6 +1097,30 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             continue;
         }
 
+        // Thread filter — works regardless of which pane has focus.
+        if (ch == 't') {
+            if (!ps.threads.empty()) {
+                if (ui.tid_filter == -1) {
+                    ui.tid_filter = ps.threads[0].tid;
+                } else {
+                    bool advanced = false;
+                    for (size_t i = 0; i < ps.threads.size(); i++) {
+                        if (ps.threads[i].tid == ui.tid_filter) {
+                            ui.tid_filter = (i+1 < ps.threads.size())
+                                            ? ps.threads[i+1].tid : -1;
+                            advanced = true;
+                            break;
+                        }
+                    }
+                    if (!advanced) ui.tid_filter = -1;
+                }
+                // Pause auto-follow so the user can browse the filtered view.
+                if (live) ui.auto_follow = false;
+                ui.rebuild();
+            }
+            goto next_draw;
+        }
+
         if (!ui.focus_detail && !ui.focus_hotfn) {
             // ── List navigation ──────────────────────────────────────────
             int h, w2; getmaxyx(win.list, h, w2); (void)w2;
@@ -1120,23 +1181,6 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             } else if (ch == '3') {
                 ui.sort_rev = (ui.sort == S_THREAD) ? !ui.sort_rev : false;
                 ui.sort = S_THREAD; ui.rebuild();
-            } else if (ch == 't') {
-                if (ps.threads.empty()) goto next_draw;
-                if (ui.tid_filter == -1) {
-                    ui.tid_filter = ps.threads[0].tid;
-                } else {
-                    bool advanced = false;
-                    for (size_t i = 0; i < ps.threads.size(); i++) {
-                        if (ps.threads[i].tid == ui.tid_filter) {
-                            ui.tid_filter = (i+1 < ps.threads.size())
-                                            ? ps.threads[i+1].tid : -1;
-                            advanced = true;
-                            break;
-                        }
-                    }
-                    if (!advanced) ui.tid_filter = -1;
-                }
-                ui.rebuild();
             }
         } else if (ui.focus_detail) {
             // ── Detail pane navigation ───────────────────────────────────
@@ -1151,7 +1195,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         } else {
             // ── Hot-fn pane navigation ───────────────────────────────────
             int page = HOTFN_H - 2;
-            auto funcs = compute_hot_funcs(*ui.ps, ui.tid_filter, INT_MAX);
+            const auto& funcs = ui.hot_funcs();
             int  total = (int)funcs.size();
             int  max_top = max(0, total - page);
             if      (ch == KEY_UP   || ch == 'k') ui.hotfn_top = max(0, ui.hotfn_top - 1);
