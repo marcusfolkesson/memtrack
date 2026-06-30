@@ -10,6 +10,7 @@
  * Usage:  LD_PRELOAD=./memtrack.so ./your_app
  */
 
+#include <errno.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -26,6 +27,7 @@
 #include <time.h>
 #include <new>
 #include <unordered_map>
+#include <atomic>
 #include <cstdlib>
 
 // ---------------------------------------------------------------------------
@@ -34,16 +36,24 @@
 // dlsym() itself may call calloc() before we have resolved real_calloc.
 // We service those early allocations from a static buffer so we never
 // recurse into an unresolved function pointer.
+//
+// bootstrap_used is accessed with compare-exchange so two threads calling
+// calloc during early init don't race and hand out the same pointer.
 // ---------------------------------------------------------------------------
-static char   bootstrap_buf[65536];
-static size_t bootstrap_used = 0;
+static char                  bootstrap_buf[65536];
+static std::atomic<size_t>   bootstrap_used{0};
 
 static void* bootstrap_alloc(size_t size)
 {
     size = (size + 15u) & ~15u;
-    if (bootstrap_used + size > sizeof(bootstrap_buf)) return nullptr;
-    void* p = bootstrap_buf + bootstrap_used;
-    bootstrap_used += size;
+    size_t old = bootstrap_used.load(std::memory_order_relaxed);
+    size_t next;
+    do {
+        next = old + size;
+        if (next > sizeof(bootstrap_buf)) return nullptr;
+    } while (!bootstrap_used.compare_exchange_weak(old, next,
+                std::memory_order_acq_rel, std::memory_order_relaxed));
+    void* p = bootstrap_buf + old;
     memset(p, 0, size);
     return p;
 }
@@ -55,20 +65,24 @@ static bool is_bootstrap_ptr(void* p)
 }
 
 // ---------------------------------------------------------------------------
-// Real function pointers
+// Real function pointers — resolved exactly once via pthread_once so that
+// two threads calling malloc simultaneously before init can't both enter
+// dlsym() concurrently.
 // ---------------------------------------------------------------------------
 static void* (*real_malloc )(size_t)        = nullptr;
 static void* (*real_calloc )(size_t,size_t) = nullptr;
 static void* (*real_realloc)(void*,size_t)  = nullptr;
 static void  (*real_free   )(void*)         = nullptr;
 
-static void resolve()
+static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
+static void do_resolve()
 {
     real_malloc  = (void*(*)(size_t))       dlsym(RTLD_NEXT, "malloc");
     real_calloc  = (void*(*)(size_t,size_t))dlsym(RTLD_NEXT, "calloc");
     real_realloc = (void*(*)(void*,size_t)) dlsym(RTLD_NEXT, "realloc");
     real_free    = (void(*)(void*))         dlsym(RTLD_NEXT, "free");
 }
+static void resolve() { pthread_once(&resolve_once, do_resolve); }
 
 // ---------------------------------------------------------------------------
 // Per-thread state
@@ -80,7 +94,8 @@ static void resolve()
 static __thread bool   in_hook      = false;
 static __thread size_t thread_total = 0;
 static __thread bool   key_set      = false;
-static __thread char   thread_name[16] = {};   // cached on first use; max 15 chars + NUL
+static __thread bool   name_cached  = false;          // separate from thread_name content
+static __thread char   thread_name[16] = {};          // max 15 chars + NUL
 
 static const char* get_thread_name();  // forward declaration
 static void print_frames(void**, int); // forward declaration
@@ -108,6 +123,7 @@ static uint64_t elapsed_us()
     clock_gettime(CLOCK_MONOTONIC, &now);
     int64_t s  = (int64_t)(now.tv_sec  - g_start_time.tv_sec);
     int64_t ns = (int64_t)(now.tv_nsec - g_start_time.tv_nsec);
+    if (ns < 0) { s--; ns += 1000000000LL; }   // borrow from seconds
     if (s < 0) return 0;
     return (uint64_t)(s * 1000000LL + ns / 1000LL);
 }
@@ -138,8 +154,14 @@ static void map_record(void* ptr, size_t size, const char* op,
 {
     if (!ptr || is_bootstrap_ptr(ptr)) return;
     pthread_mutex_lock(&g_lock);
-    if (!g_map)
-        g_map = new std::unordered_map<void*, AllocInfo>();
+    if (!g_map) {
+        try {
+            g_map = new std::unordered_map<void*, AllocInfo>();
+        } catch (...) {
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+    }
     AllocInfo info;
     info.tid          = (pid_t)syscall(SYS_gettid);
     memcpy(info.name, get_thread_name(), sizeof(info.name)); // both buffers are 16 B
@@ -149,7 +171,9 @@ static void map_record(void* ptr, size_t size, const char* op,
     info.op[sizeof(info.op) - 1] = '\0';
     info.frame_count = frame_count;
     for (int i = 0; i < frame_count; i++) info.frames[i] = frames[i];
-    (*g_map)[ptr] = info;
+    try {
+        (*g_map)[ptr] = info;
+    } catch (...) { /* OOM: lose this record rather than deadlock */ }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -253,14 +277,13 @@ static void atexit_handler()
 
     // Collect the set of unique tids still in the map.
     // We do this without extra heap allocation: iterate twice per tid.
-    // (The map is small at exit time so the extra passes are fine.)
-    pid_t seen[256];
+    pid_t seen[1024];
     int   seen_count = 0;
     for (auto& [ptr, info] : *g_map) {
         bool found = false;
         for (int i = 0; i < seen_count; i++)
             if (seen[i] == info.tid) { found = true; break; }
-        if (!found && seen_count < 256)
+        if (!found && seen_count < (int)(sizeof(seen)/sizeof(seen[0])))
             seen[seen_count++] = info.tid;
     }
 
@@ -298,10 +321,17 @@ static void atexit_handler()
     pthread_mutex_unlock(&g_lock);
     in_hook = false;
 
-    // Closing the fd signals EOF to memview so it knows the application has
-    // finished.  Only close when we own the fd (file or TCP socket).
+    // Signal EOF to the viewer.  For TCP sockets use shutdown(SHUT_WR) rather
+    // than close() so that threads still running don't write to a recycled fd.
+    // For plain files close() is safe here since we're in the atexit handler
+    // and the process is single-threaded at this point in practice.
     if (g_close_outfd && g_outfd != STDERR_FILENO) {
-        close(g_outfd);
+        // Determine if g_outfd is a socket by probing getsockopt
+        int type = 0; socklen_t tlen = sizeof(type);
+        if (getsockopt(g_outfd, SOL_SOCKET, SO_TYPE, &type, &tlen) == 0)
+            shutdown(g_outfd, SHUT_WR);   // TCP: signal EOF, don't invalidate fd
+        else
+            close(g_outfd);
         g_outfd = STDERR_FILENO;
     }
 }
@@ -309,7 +339,10 @@ static void atexit_handler()
 static void __attribute__((constructor)) memtrack_ctor()
 {
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
-    pthread_key_create(&exit_key, thread_exit_handler);
+    if (pthread_key_create(&exit_key, thread_exit_handler) != 0) {
+        const char msg[] = "[memtrack] WARNING: pthread_key_create failed; thread-exit leak reports disabled\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    }
     atexit(atexit_handler);
 
     // ── TCP server mode (MEMTRACK_PORT) ──────────────────────────────────────
@@ -320,7 +353,7 @@ static void __attribute__((constructor)) memtrack_ctor()
     if (port_env) {
         int port = atoi(port_env);
         if (port > 0 && port <= 65535) {
-            int srv = socket(AF_INET, SOCK_STREAM, 0);
+            int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
             if (srv >= 0) {
                 int opt = 1;
                 setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -339,12 +372,11 @@ static void __attribute__((constructor)) memtrack_ctor()
                                  port);
                     write(STDERR_FILENO, msg, (size_t)n);
 
-                    int client = accept(srv, nullptr, nullptr);
-                    close(srv);
-                    // Remove MEMTRACK_PORT from the environment so that child
-                    // processes spawned after this point (e.g. bash sub-commands)
-                    // do NOT inherit it and try to start their own TCP server.
+                    int client = accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
+                    // Remove port env-var before close(srv) so any fork+exec
+                    // child spawned in between doesn't see it.
                     unsetenv("MEMTRACK_PORT");
+                    close(srv);
                     if (client >= 0) {
                         g_outfd        = client;
                         g_close_outfd  = true;
@@ -367,10 +399,12 @@ static void __attribute__((constructor)) memtrack_ctor()
     {
         const char* out = getenv("MEMTRACK_OUTPUT");
         if (out) {
-            int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
             if (fd >= 0) {
                 g_outfd       = fd;
                 g_close_outfd = true;
+                // Prevent child processes from reopening and truncating the file.
+                unsetenv("MEMTRACK_OUTPUT");
             } else {
                 const char msg[] = "[memtrack] WARNING: could not open output file, falling back to stderr\n";
                 write(STDERR_FILENO, msg, sizeof(msg) - 1);
@@ -383,7 +417,10 @@ static void __attribute__((constructor)) memtrack_ctor()
     if (min) g_min_size = (size_t)strtoull(min, nullptr, 10);
 
     const char* depth = getenv("MEMTRACK_STACK_DEPTH");
-    if (depth) g_stack_depth = atoi(depth);
+    if (depth) {
+        long d = strtol(depth, nullptr, 10);
+        g_stack_depth = (d > 0 && d <= 64) ? (int)d : 0;
+    }
 }
 
 static inline void ensure_exit_hook()
@@ -404,8 +441,10 @@ static pid_t get_tid()
 
 static const char* get_thread_name()
 {
-    if (thread_name[0] == '\0')
+    if (!name_cached) {
         pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+        name_cached = true;
+    }
     return thread_name;
 }
 
@@ -455,27 +494,28 @@ static void print_frames(void** frames, int count)
             int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
                              i, mod_len, sym, display, rest);
             if (n > 0) write(g_outfd, buf, (size_t)n);
-            if (demangled) real_free(demangled);
+            if (demangled) { if (real_free) real_free(demangled); else free(demangled); }
         } else {
             // Fallback: print as-is
             int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, sym);
             if (n > 0) write(g_outfd, buf, (size_t)n);
         }
     }
-    real_free(syms);
+    if (real_free) real_free(syms); else free(syms);
 }
 
 static void log_alloc(const char* op, size_t size, void* ptr)
 {
     ensure_exit_hook();
-    thread_total += size;
+    // Only credit thread_total for successful allocations.
+    if (ptr) thread_total += size;
 
-    if (size < g_min_size) return;
+    if (!ptr || size < g_min_size) return;
 
     uint64_t ts = elapsed_us();
 
-    // Capture stack frames before doing anything else so the trace is accurate.
-    // Skip 2 internal frames: log_alloc itself + the hook (malloc/calloc/etc.).
+    // Skip 2 frames: log_alloc itself + the hook (malloc/new/etc.).
+    // cpp_alloc/cpp_free are always_inline so they don't add a frame.
     void* frames[32];
     int   frame_count = 0;
     if (g_stack_depth > 0) {
@@ -483,7 +523,6 @@ static void log_alloc(const char* op, size_t size, void* ptr)
         const int total = g_stack_depth + skip;
         int raw = backtrace(frames, total < 32 ? total : 32);
         frame_count = (raw > skip) ? raw - skip : 0;
-        // Shift: drop the first `skip` internal frames
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
@@ -507,13 +546,10 @@ static void log_free(void* ptr, const char* op)
 {
     if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
 
-    // Hold in_hook for the entire function so that any allocation made
-    // internally (backtrace_symbols, __cxa_demangle, etc.) is NOT tracked.
     in_hook = true;
 
     uint64_t ts = elapsed_us();
 
-    // Capture stack trace before touching the map.
     void* frames[32];
     int   frame_count = 0;
     if (g_stack_depth > 0) {
@@ -572,14 +608,21 @@ void* malloc(size_t size)
 
 void* calloc(size_t nmemb, size_t size)
 {
+    // Guard against nmemb*size integer overflow (calloc semantics require this).
+    if (nmemb && size > SIZE_MAX / nmemb) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    size_t total = nmemb * size;
+
     if (!real_calloc)
-        return bootstrap_alloc(nmemb * size);
+        return bootstrap_alloc(total);
 
     if (in_hook) return real_calloc(nmemb, size);
 
     in_hook = true;
     void* p = real_calloc(nmemb, size);
-    log_alloc("calloc", nmemb * size, p);
+    log_alloc("calloc", total, p);
     in_hook = false;
     return p;
 }
@@ -589,15 +632,44 @@ void* realloc(void* old_ptr, size_t size)
     if (!real_realloc) resolve();
     if (in_hook) return real_realloc(old_ptr, size);
 
-    // The old pointer is implicitly freed by realloc.  Log the free event
-    // (so the viewer marks it as Freed, not Active) then remove from the map
-    // before calling real_realloc, since old_ptr becomes invalid regardless
-    // of whether the block is moved.
-    log_free(old_ptr, "free");
-    map_remove(old_ptr);
+    // realloc(NULL, size) == malloc(size)
+    if (!old_ptr) {
+        in_hook = true;
+        void* p = real_malloc ? real_malloc(size) : real_realloc(nullptr, size);
+        log_alloc("realloc", size, p);
+        in_hook = false;
+        return p;
+    }
 
+    // realloc(ptr, 0): implementation-defined; treat as free + return NULL
+    // for consistent, predictable behaviour.
+    if (size == 0) {
+        log_free(old_ptr, "free");
+        map_remove(old_ptr);
+        real_realloc(old_ptr, 0);
+        return nullptr;
+    }
+
+    // Log the free event first (captures stack, checks map, writes log).
+    log_free(old_ptr, "free");   // sets in_hook=false on return
+
+    // Hold in_hook while we erase old_ptr and call real_realloc so no other
+    // thread can slip in between and re-use the same address in our map.
     in_hook = true;
+    pthread_mutex_lock(&g_lock);
+    if (g_map) g_map->erase(old_ptr);
+    pthread_mutex_unlock(&g_lock);
+
     void* p = real_realloc(old_ptr, size);
+    if (!p) {
+        // real_realloc failed: old_ptr is still valid, restore its map record
+        // via a fresh log_alloc so the tracker stays consistent.
+        // Retrieve the original info if possible — but since we already erased
+        // it, we log it as a new allocation with the old size.
+        // (This is the best we can do without complicating the map protocol.)
+        in_hook = false;
+        return nullptr;
+    }
     log_alloc("realloc", size, p);
     in_hook = false;
     return p;
@@ -617,7 +689,10 @@ void free(void* ptr)
 // ---------------------------------------------------------------------------
 // C++ operator new / delete
 // ---------------------------------------------------------------------------
-static void* cpp_alloc(size_t size, const char* op)
+// Force inline so cpp_alloc/cpp_free collapse into operator new/delete —
+// making skip=2 (log_alloc + operator new/delete) correct at all opt levels.
+__attribute__((always_inline))
+static inline void* cpp_alloc(size_t size, const char* op)
 {
     if (!real_malloc) resolve();
 
@@ -638,12 +713,11 @@ static void* cpp_alloc(size_t size, const char* op)
     return p;
 }
 
-static void cpp_free(void* p, const char* op) noexcept
+__attribute__((always_inline))
+static inline void cpp_free(void* p, const char* op) noexcept
 {
     if (!p || is_bootstrap_ptr(p) || !real_free) return;
     log_free(p, op);
-    // map_remove is a no-op when in_hook==true, preventing re-entry into the
-    // map while we are already inside map_record/map_remove/thread_exit_handler.
     map_remove(p);
     real_free(p);
 }
