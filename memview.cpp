@@ -69,9 +69,12 @@ struct AllocRecord {
 struct ThreadInfo {
     int    tid            = 0;
     string name;
-    size_t total_bytes    = 0;
+    size_t allocated      = 0;   // total bytes ever allocated by this thread
+    size_t freed          = 0;   // total bytes freed by this thread (from its own allocs)
+    size_t total_bytes    = 0;   // running total counter (from EXIT line)
     size_t leak_count     = 0;
     size_t leak_bytes     = 0;
+    size_t net() const { return allocated >= freed ? allocated - freed : 0; }
 };
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
@@ -190,8 +193,8 @@ static void parse_line(const char* line, ParseState& st)
         sscanf(after, "%*s ts=%llu size=%zu total=%zu ptr=%p", &ts_ull, &sz, &total, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
-        // Register the thread so 't' (thread filter) works before the thread exits.
-        st.thread(tid, tname);
+        // Register thread and track bytes allocated.
+        st.thread(tid, tname).allocated += sz;
 
         AllocRecord rec;
         rec.ptr          = ptr;
@@ -218,12 +221,16 @@ static void parse_line(const char* line, ParseState& st)
         sscanf(after, "%*s ts=%llu size=%zu ptr=%p", &ts_ull, &sz, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
-        // Register the thread so 't' works before the thread exits.
+        // Register the freeing thread (so 't' can filter by it) but apply the
+        // freed bytes to the ALLOCATING thread so Net(live) = memory that thread
+        // still owns, regardless of which thread happens to call free().
         st.thread(tid, tname);
 
         auto it = st.ptr_idx.find(ptr);
         if (it != st.ptr_idx.end()) {
             auto& rec              = st.records[it->second];
+            // Credit the freed bytes back to whoever allocated the memory.
+            st.thread(rec.tid, rec.thread_name).freed += rec.size;
             rec.freed              = true;
             rec.free_tid           = tid;
             rec.free_thread_name   = tname;
@@ -433,8 +440,6 @@ static const char* filter_label[] = { "All", "Leaks", "Active", "Freed" };
 enum SortMode  { S_TIME, S_SIZE, S_THREAD, S_COUNT };
 static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
-// Forward declaration — full definition appears below, after the helpers it uses.
-struct FuncStat;
 
 struct UI {
     ParseState*    ps           = nullptr;
@@ -451,11 +456,6 @@ struct UI {
     int            hotfn_top    = 0;    // scroll offset in hot-fn pane
     bool           live          = false;
     bool           auto_follow   = true; // scroll to newest in live mode
-
-    // Cached hot-function list — recomputed only after rebuild().
-    mutable vector<FuncStat> hotfn_cache;
-    mutable size_t  hotfn_cache_rec_count = SIZE_MAX; // ps->records.size() at cache time
-    mutable int     hotfn_cache_tid = -2; // tid_filter at cache time (-2 = invalid)
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -505,13 +505,7 @@ struct UI {
             selected = min(selected, (int)visible.size() - 1);
             if (selected < 0) selected = 0;
         }
-
-        // Invalidate hot-function cache whenever data or filter changes.
-        hotfn_cache_rec_count = SIZE_MAX;
     }
-
-    // Return cached hot functions, recomputing only when needed.
-    const vector<FuncStat>& hot_funcs() const;
 
     const AllocRecord* current() const {
         if (visible.empty()) return nullptr;
@@ -555,77 +549,6 @@ static void hline_to_eol(WINDOW* w, int y, int col_pair)
     wattron(w, COLOR_PAIR(col_pair));
     while (x < width) { mvwaddch(w, y, x++, ' '); }
     wattroff(w, COLOR_PAIR(col_pair));
-}
-
-// ─── Hot-function aggregation ─────────────────────────────────────────────────
-//
-// Groups every AllocRecord by the function in frame #0 of its alloc stack
-// (falling back to the op name if no frames were captured).  Returns the top N
-// callers ranked by net unfreed bytes (allocated − freed).
-
-struct FuncStat {
-    string name;
-    size_t allocated = 0;
-    size_t freed     = 0;
-    size_t net() const { return allocated >= freed ? allocated - freed : 0; }
-};
-
-// Extract the demangled function name from a backtrace_symbols line.
-// Input looks like:  ./binary(SomeName()+0xNN) [0xADDR]
-// Returns "SomeName()" or, when no symbol is available, the module path.
-static string extract_func_name(const string& frame)
-{
-    auto lp   = frame.find('(');
-    if (lp == string::npos) return frame;
-    // Search for "+0x" (the offset marker) rather than any '+' or ')' so that
-    // demangled names containing parentheses (e.g. "test()" or "foo(int, void*)")
-    // are extracted correctly.
-    auto plus = frame.find("+0x", lp + 1);
-    if (plus == string::npos || plus == lp + 1)
-        return frame.substr(0, lp);         // no symbol — use module name
-    return frame.substr(lp + 1, plus - lp - 1);
-}
-
-static vector<FuncStat> compute_hot_funcs(const ParseState& ps, int tid_filter,
-                                           int top_n = 5)
-{
-    unordered_map<string, FuncStat> agg;
-
-    for (const auto& r : ps.records) {
-        if (tid_filter != -1 && r.tid != tid_filter) continue;
-        const string key = r.frames.empty()
-                           ? r.op
-                           : extract_func_name(r.frames[0]);
-        auto& s   = agg[key];
-        s.name     = key;
-        s.allocated += r.size;
-        if (r.freed) s.freed += r.size;
-    }
-
-    vector<FuncStat> result;
-    result.reserve(agg.size());
-    for (auto& [name, stat] : agg)
-        result.push_back(std::move(stat));
-
-    std::stable_sort(result.begin(), result.end(),
-                     [](const FuncStat& a, const FuncStat& b) {
-                         return a.net() > b.net();
-                     });
-
-    if ((int)result.size() > top_n) result.resize((size_t)top_n);
-    return result;
-}
-
-// UI::hot_funcs() — defined here so compute_hot_funcs is in scope.
-const vector<FuncStat>& UI::hot_funcs() const
-{
-    if (hotfn_cache_rec_count != ps->records.size() ||
-        hotfn_cache_tid       != tid_filter) {
-        hotfn_cache           = compute_hot_funcs(*ps, tid_filter, INT_MAX);
-        hotfn_cache_rec_count = ps->records.size();
-        hotfn_cache_tid       = tid_filter;
-    }
-    return hotfn_cache;
 }
 
 // ─── Draw: header ────────────────────────────────────────────────────────────
@@ -895,60 +818,73 @@ static void draw_status(WINDOW* w, const UI& ui)
 
 // ─── Draw: hot functions pane ────────────────────────────────────────────────
 
-static void draw_hotfn(WINDOW* w, const UI& ui)
+static void draw_threads(WINDOW* w, const UI& ui)
 {
     int rows, cols; getmaxyx(w, rows, cols);
     werase(w);
 
     bool focused = ui.focus_hotfn;
 
-    // Compute ALL functions (no top_n cap) — sorted by net unfreed bytes desc.
-    const auto& funcs = ui.hot_funcs();
-    int  total  = (int)funcs.size();
-    int  page   = rows - 2;          // visible data rows
+    const auto& threads = ui.ps->threads;
+    int  total = (int)threads.size();
+    int  page  = rows - 2;
 
-    // Clamp scroll offset (const_cast-free: caller must clamp before calling)
     int top = max(0, min(ui.hotfn_top, max(0, total - page)));
 
     // Title row
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
-    mvwaddstr(w, 0, 0, focused ? " Top functions [j/k:scroll  Tab:unfocus]" :
-                                 " Top functions by unfreed memory");
+    mvwaddstr(w, 0, 0, focused ? " Threads [j/k:scroll  Tab:unfocus]" :
+                                 " Thread summary");
     if (ui.tid_filter != -1) {
-        for (auto& t : ui.ps->threads)
+        for (auto& t : threads)
             if (t.tid == ui.tid_filter)
-                wprintw(w, "  [thread: %s]", t.name.c_str());
+                wprintw(w, "  [filter: %s]", t.name.c_str());
     }
-    // Scroll indicator in title
     if (total > page) {
         char scroll_info[32];
         snprintf(scroll_info, sizeof(scroll_info), " %d-%d/%d ",
                  top + 1, min(top + page, total), total);
         int si_len = (int)strlen(scroll_info);
-        int h2; getmaxyx(w, h2, cols); (void)h2;
         mvwaddstr(w, 0, cols - si_len, scroll_info);
     }
     hline_to_eol(w, 0, C_HEADER);
 
     // Column header
-    int name_w = max(8, cols - 37);
-    mvwprintw(w, 1, 0, " %-*s  %10s  %10s  %10s",
-              name_w, "Function", "Allocated", "Freed", "Net (live)");
+    int name_w = max(8, cols - 52);
+    mvwprintw(w, 1, 0, " %-*s  %6s  %10s  %10s  %10s  %s",
+              name_w, "Thread", "TID", "Allocated", "Freed", "Net(live)", "Leaks");
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
-    // Data rows
+    // Data rows — sorted by net descending
+    vector<const ThreadInfo*> sorted;
+    sorted.reserve(threads.size());
+    for (auto& t : threads) sorted.push_back(&t);
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [](const ThreadInfo* a, const ThreadInfo* b) {
+                         return a->net() > b->net();
+                     });
+
     for (int i = 0; i < page && (top + i) < total; i++) {
-        const auto& f   = funcs[top + i];
-        size_t net      = f.net();
-        int cp          = (net > 0) ? C_LEAK : C_ALLOC;
-        int attr        = (i == 0 && top == 0 && net > 0) ? (int)A_BOLD : 0;
+        const ThreadInfo& t = *sorted[top + i];
+        size_t net = t.net();
+        bool   selected_thread = (ui.tid_filter == t.tid);
+        int cp   = selected_thread ? C_SEL : (net > 0 ? C_LEAK : C_ALLOC);
+        int attr = selected_thread ? (int)A_BOLD : 0;
+
+        char leak_buf[32] = "-";
+        if (t.leak_count > 0)
+            snprintf(leak_buf, sizeof(leak_buf), "%zu (%s)",
+                     t.leak_count, fmt_size(t.leak_bytes).c_str());
+
         wattron(w, COLOR_PAIR(cp) | attr);
-        mvwprintw(w, i + 2, 0, " %-*.*s  %10s  %10s  %10s",
-                  name_w, name_w, f.name.c_str(),
-                  fmt_size(f.allocated).c_str(),
-                  fmt_size(f.freed).c_str(),
-                  fmt_size(net).c_str());
+        mvwprintw(w, i + 2, 0, " %-*.*s  %6d  %10s  %10s  %10s  %s",
+                  name_w, name_w, t.name.c_str(),
+                  t.tid,
+                  fmt_size(t.allocated).c_str(),
+                  fmt_size(t.freed).c_str(),
+                  fmt_size(net).c_str(),
+                  leak_buf);
         hline_to_eol(w, i + 2, cp);
         wattroff(w, COLOR_PAIR(cp) | attr);
     }
@@ -965,28 +901,37 @@ struct Windows {
 // Exact column width required for the list pane:
 //   " [X] " (5) + ptr "%-18s " (19) + op "%-9s " (10) +
 //   time "%-12s " (13) + size "%-9s " (10) + thread "%-15s" (15) = 72
-static constexpr int LIST_W  = 72;
-// Hot-function pane height: 1 title + 1 col header + 5 data rows
-static constexpr int HOTFN_H = 7;
+static constexpr int LIST_W      = 72;
+static constexpr int BODY_MIN    = 5;   // list pane always gets at least this many rows
+static constexpr int THREADS_HDR = 2;   // title + column header rows
+
+// Thread pane height: 2 header rows + one row per thread, capped at 1/3 of
+// the total terminal height so the list/detail pane always gets enough space.
+static int threads_pane_h(int n_threads)
+{
+    int max_h = max(THREADS_HDR + 1, LINES / 3);
+    int want  = THREADS_HDR + max(1, n_threads);
+    return min(want, max_h);
+}
 
 // Actual list pane width — shrinks to half on very narrow terminals so the
 // detail pane always gets at least 30 columns.
 static int list_pane_w() { return (COLS >= LIST_W + 30) ? LIST_W : COLS / 2; }
-// Body height: total rows minus header(2), hotfn pane, and status(2).
-static int body_height()  { return LINES - 2 - HOTFN_H - 2; }
+// Body height: total rows minus header(2), thread pane, and status(2).
+static int body_height(int th_h)  { return LINES - 2 - th_h - 2; }
 
-static Windows make_windows()
+static Windows make_windows(int th_h)
 {
     int rows = LINES, cols = COLS;
-    int lw     = list_pane_w();
-    int body   = body_height();
-    int hotfn_y = 2 + body;
+    int lw      = list_pane_w();
+    int body    = body_height(th_h);
+    int th_y    = 2 + body;
     return {
-        newwin(2,       cols,       0,        0),
-        newwin(body,    lw,         2,        0),
-        newwin(body,    cols-lw-1,  2,        lw+1),
-        newwin(HOTFN_H, cols,       hotfn_y,  0),
-        newwin(2,       cols,       rows-2,   0),
+        newwin(2,    cols,      0,    0),
+        newwin(body, lw,        2,    0),
+        newwin(body, cols-lw-1, 2,    lw+1),
+        newwin(th_h, cols,      th_y, 0),
+        newwin(2,    cols,      rows-2, 0),
     };
 }
 
@@ -1017,18 +962,28 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
     // without starving keyboard input.
     if (live) wtimeout(stdscr, 50);
 
-    Windows win = make_windows();
+    Windows win = make_windows(threads_pane_h((int)ps.threads.size()));
+    int win_thread_count = (int)ps.threads.size(); // track for dynamic resize
+
+    auto rebuild_windows = [&]() {
+        int th_h = threads_pane_h((int)ps.threads.size());
+        free_windows(win);
+        clear(); refresh();
+        win = make_windows(th_h);
+        win_thread_count = (int)ps.threads.size();
+    };
 
     auto redraw = [&]() {
+        int th_h = threads_pane_h((int)ps.threads.size());
         int lw = list_pane_w();
         attron(COLOR_PAIR(C_DIM) | A_DIM);
-        mvvline(2, lw, ACS_VLINE, body_height());
+        mvvline(2, lw, ACS_VLINE, body_height(th_h));
         attroff(COLOR_PAIR(C_DIM) | A_DIM);
         refresh();
         draw_header(win.header, ui, filename, reader);
         draw_list(win.list, ui);
         draw_detail(win.detail, ui);
-        draw_hotfn(win.hotfn, ui);
+        draw_threads(win.hotfn, ui);
         draw_status(win.status, ui);
     };
 
@@ -1056,6 +1011,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             if (reset) {
                 // Application restarted — full UI reset.
                 ui.rebuild(true);
+                rebuild_windows();
                 redraw();
             } else if (new_lines > 0) {
                 int prev_vis = (int)ui.visible.size();
@@ -1065,6 +1021,9 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                     ui.selected = max(0, (int)ui.visible.size() - 1);
                     ensure_visible();
                 }
+                // Rebuild windows if a new thread appeared.
+                if ((int)ps.threads.size() != win_thread_count)
+                    rebuild_windows();
                 redraw();
             }
             continue;
@@ -1074,9 +1033,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
 
         // Resize
         if (ch == KEY_RESIZE) {
-            free_windows(win);
-            clear(); refresh();
-            win = make_windows();
+            rebuild_windows();
             redraw();
             continue;
         }
@@ -1206,11 +1163,10 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             else if (ch == KEY_HOME || ch == 'g') ui.detail_top = 0;
             else if (ch == 'G') ui.detail_top = INT_MAX;  // clamped on draw
         } else {
-            // ── Hot-fn pane navigation ───────────────────────────────────
-            int page = HOTFN_H - 2;
-            const auto& funcs = ui.hot_funcs();
-            int  total = (int)funcs.size();
-            int  max_top = max(0, total - page);
+            // ── Thread pane navigation ───────────────────────────────────
+            int page  = threads_pane_h((int)ps.threads.size()) - THREADS_HDR;
+            int total = (int)ps.threads.size();
+            int max_top = max(0, total - page);
             if      (ch == KEY_UP   || ch == 'k') ui.hotfn_top = max(0, ui.hotfn_top - 1);
             else if (ch == KEY_DOWN || ch == 'j') ui.hotfn_top = min(max_top, ui.hotfn_top + 1);
             else if (ch == KEY_PPAGE || ch == ctrl('b')) ui.hotfn_top = max(0, ui.hotfn_top - page);
@@ -1321,20 +1277,19 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // Diagnostic mode: dump hot functions and exit (no ncurses).
+    // Diagnostic mode: dump thread summary and exit (no ncurses).
     if (dump_hotfn) {
-        auto funcs = compute_hot_funcs(ps, -1, 10);
-        printf("Records: %zu  |  Hot functions (top %zu):\n\n",
-               ps.records.size(), funcs.size());
-        printf("  %-45s  %12s  %12s  %12s\n",
-               "Function", "Allocated", "Freed", "Net (live)");
-        printf("  %s\n", string(88, '-').c_str());
-        for (auto& f : funcs) {
-            printf("  %-45s  %12s  %12s  %12s\n",
-                   f.name.c_str(),
-                   fmt_size(f.allocated).c_str(),
-                   fmt_size(f.freed).c_str(),
-                   fmt_size(f.net()).c_str());
+        printf("Records: %zu  |  Threads: %zu\n\n",
+               ps.records.size(), ps.threads.size());
+        printf("  %-20s  %8s  %12s  %12s  %12s\n",
+               "Thread", "TID", "Allocated", "Freed", "Net (live)");
+        printf("  %s\n", string(72, '-').c_str());
+        for (auto& t : ps.threads) {
+            printf("  %-20s  %8d  %12s  %12s  %12s\n",
+                   t.name.c_str(), t.tid,
+                   fmt_size(t.allocated).c_str(),
+                   fmt_size(t.freed).c_str(),
+                   fmt_size(t.net()).c_str());
         }
         return 0;
     }
