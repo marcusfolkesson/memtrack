@@ -128,13 +128,20 @@ If all allocations were freed:
 MEMTRACK_OUTPUT=run.log MEMTRACK_STACK_DEPTH=8 LD_PRELOAD=./memtrack.so ./your_app
 ./memview run.log
 
-# Live mode: start the viewer before or during a run — updates every 250 ms
+# Live mode: start the viewer before or during a run — updates every 50 ms
 MEMTRACK_OUTPUT=run.log LD_PRELOAD=./memtrack.so ./your_app &
 ./memview -f run.log
 
 # Pipe directly (live via stdin)
 MEMTRACK_OUTPUT=/dev/stdout LD_PRELOAD=./memtrack.so ./your_app | ./memview -f -
+
+# TCP mode: connect directly to a running process (saves stream to file too)
+./memview :4242 -o run.log
+./memview myhost:4242 -o run.log
 ```
+
+**`-o` / `--save <file>`** — when viewing a TCP stream, tee every received line to a file.
+The saved file is a valid memtrack log that can be replayed later with `./memview run.log`.
 
 ### Layout
 

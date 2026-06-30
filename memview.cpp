@@ -270,6 +270,17 @@ struct LiveReader {
     bool   is_socket    = false;  // TCP connection — no seek, EOF = disconnected
     bool   disconnected = false;  // server closed the connection
 
+    FILE*  save_fp      = nullptr; // optional file to tee all received lines into
+
+    ~LiveReader() {
+        if (save_fp) { fflush(save_fp); fclose(save_fp); save_fp = nullptr; }
+    }
+
+    bool open_save(const string& savepath) {
+        save_fp = fopen(savepath.c_str(), "w");
+        return save_fp != nullptr;
+    }
+
     // `initial_pos` is the byte offset after the initial parse so we don't
     // re-process already-seen lines.
     void open(const string& p, long initial_pos = 0)
@@ -364,6 +375,8 @@ struct LiveReader {
         static constexpr int MAX_LINES_PER_POLL = 500;
         int limit = MAX_LINES_PER_POLL;
         while (limit-- > 0 && fgets(line_buf, sizeof(line_buf), fp)) {
+            // Tee raw line (including newline) to the save file before parsing.
+            if (save_fp) fputs(line_buf, save_fp);
             size_t len = strlen(line_buf);
             if (len > 0 && line_buf[len - 1] == '\n') line_buf[len - 1] = '\0';
             parse_line(line_buf, st);
@@ -1237,6 +1250,7 @@ int main(int argc, char* argv[])
 {
     bool   live = false;
     string path;
+    string save_path;   // --save / -o <file>
 
     bool dump_hotfn = false;
     for (int i = 1; i < argc; i++) {
@@ -1244,6 +1258,8 @@ int main(int argc, char* argv[])
             live = true;
         else if (!strcmp(argv[i], "--dump-hotfn"))
             dump_hotfn = true;
+        else if ((!strcmp(argv[i], "--save") || !strcmp(argv[i], "-o")) && i+1 < argc)
+            save_path = argv[++i];
         else if (argv[i][0] != '-' || !strcmp(argv[i], "-"))
             path = argv[i];
         else {
@@ -1259,10 +1275,11 @@ int main(int argc, char* argv[])
         fprintf(stderr,
                 "Usage: %s [-f] <memtrack.log>\n"
                 "       %s [-f] -              (stdin)\n"
-                "       %s :PORT               (connect to memtrack TCP server, localhost)\n"
-                "       %s HOST:PORT           (connect to memtrack TCP server)\n"
+                "       %s :PORT [-o save.log] (connect to memtrack TCP server, localhost)\n"
+                "       %s HOST:PORT [-o save.log]\n"
                 "\n"
-                "  -f / --follow   Live file/stdin mode (TCP is always live).\n",
+                "  -f / --follow        Live file/stdin mode (TCP is always live).\n"
+                "  -o / --save <file>   Save TCP stream to file while viewing.\n",
                 argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
@@ -1276,6 +1293,14 @@ int main(int argc, char* argv[])
         if (!reader.connect_tcp(tcp_host, tcp_port)) {
             fprintf(stderr, "[memview] connection failed: %s\n", strerror(errno));
             return 1;
+        }
+        if (!save_path.empty()) {
+            if (!reader.open_save(save_path)) {
+                fprintf(stderr, "[memview] warning: cannot open save file '%s': %s\n",
+                        save_path.c_str(), strerror(errno));
+            } else {
+                fprintf(stderr, "[memview] saving stream to '%s'\n", save_path.c_str());
+            }
         }
         fprintf(stderr, "[memview] connected\n");
         ParseState ps;
