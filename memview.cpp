@@ -18,6 +18,7 @@
  */
 
 #include <ncurses.h>
+#include <locale.h>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -950,6 +951,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
     ui.live = live;
     ui.rebuild();
 
+    setlocale(LC_ALL, "");  // enable UTF-8 so Unicode box/arrow chars render correctly
     initscr();
     cbreak();
     noecho();
