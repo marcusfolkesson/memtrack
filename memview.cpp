@@ -449,28 +449,30 @@ struct LiveReader {
 // ─── Colour pairs ────────────────────────────────────────────────────────────
 
 enum {
-    C_NORMAL = 1,  // white / black
-    C_HEADER = 2,  // white / blue   (panel headers)
-    C_ALLOC  = 3,  // green / black  (allocations)
-    C_FREE   = 4,  // yellow / black (freed)
-    C_LEAK   = 5,  // red / black    (leaks)
-    C_SEL    = 6,  // black / white  (selected row)
-    C_DIM    = 7,  // dim white      (stack frames, hints)
-    C_THREAD = 8,  // cyan / black   (thread info)
+    C_NORMAL    = 1,  // white / black
+    C_HEADER    = 2,  // white / blue   (panel headers, unfocused)
+    C_ALLOC     = 3,  // green / black  (allocations)
+    C_FREE      = 4,  // yellow / black (freed)
+    C_LEAK      = 5,  // red / black    (leaks)
+    C_SEL       = 6,  // black / white  (selected row)
+    C_DIM       = 7,  // dim white      (stack frames, hints)
+    C_THREAD    = 8,  // cyan / black   (thread info)
+    C_FOCUS_HDR = 9,  // white / cyan   (focused pane title bar)
 };
 
 static void init_colors()
 {
     start_color();
     use_default_colors();
-    init_pair(C_NORMAL, COLOR_WHITE,  COLOR_BLACK);
-    init_pair(C_HEADER, COLOR_WHITE,  COLOR_BLUE);
-    init_pair(C_ALLOC,  COLOR_GREEN,  COLOR_BLACK);
-    init_pair(C_FREE,   COLOR_YELLOW, COLOR_BLACK);
-    init_pair(C_LEAK,   COLOR_RED,    COLOR_BLACK);
-    init_pair(C_SEL,    COLOR_BLACK,  COLOR_WHITE);
-    init_pair(C_DIM,    COLOR_WHITE,  COLOR_BLACK);
-    init_pair(C_THREAD, COLOR_CYAN,   COLOR_BLACK);
+    init_pair(C_NORMAL,    COLOR_WHITE,  COLOR_BLACK);
+    init_pair(C_HEADER,    COLOR_WHITE,  COLOR_BLUE);
+    init_pair(C_ALLOC,     COLOR_GREEN,  COLOR_BLACK);
+    init_pair(C_FREE,      COLOR_YELLOW, COLOR_BLACK);
+    init_pair(C_LEAK,      COLOR_RED,    COLOR_BLACK);
+    init_pair(C_SEL,       COLOR_BLACK,  COLOR_WHITE);
+    init_pair(C_DIM,       COLOR_WHITE,  COLOR_BLACK);
+    init_pair(C_THREAD,    COLOR_CYAN,   COLOR_BLACK);
+    init_pair(C_FOCUS_HDR, COLOR_BLACK,  COLOR_CYAN);
 }
 
 // ─── UI state ────────────────────────────────────────────────────────────────
@@ -664,7 +666,9 @@ static void draw_list(WINDOW* w, const UI& ui)
     werase(w);
 
     // Sub-header — underline active sort column label only (no trailing spaces)
-    wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    bool list_focused = !ui.focus_detail && !ui.focus_hotfn;
+    int  hdr_cp = list_focused ? C_FOCUS_HDR : C_HEADER;
+    wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
     mvwaddstr(w, 0, 0, " St. ");
     waddstr(w, "Pointer            ");
     waddstr(w, "Op         ");
@@ -690,8 +694,8 @@ static void draw_list(WINDOW* w, const UI& ui)
     col("Size",   S_SIZE,   11);
     col("Thread", S_THREAD,  6);
 
-    hline_to_eol(w, 0, C_HEADER);
-    wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    hline_to_eol(w, 0, hdr_cp);
+    wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
 
     int list_rows = rows - 2;   // -1 header -1 counter
     for (int row = 0; row < list_rows; row++) {
@@ -973,12 +977,13 @@ static void draw_detail(WINDOW* w, const UI& ui)
 
     // Sub-header
     bool focused = ui.focus_detail && !ui.focus_hotfn;
-    wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    int  hdr_cp  = focused ? C_FOCUS_HDR : C_HEADER;
+    wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
     mvwprintw(w, 0, 0, " Detail%s%s",
               focused ? " [↑↓ scroll]" : "",
               ui.resolve_lines ? " [L:src ON]" : " [L:src off]");
-    hline_to_eol(w, 0, C_HEADER);
-    wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    hline_to_eol(w, 0, hdr_cp);
+    wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
 
     const AllocRecord* r = ui.current();
     if (!r) {
@@ -1083,7 +1088,8 @@ static void draw_threads(WINDOW* w, const UI& ui)
     int top = max(0, min(ui.hotfn_top, max(0, total - page)));
 
     // Title row
-    wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    int hdr_cp = focused ? C_FOCUS_HDR : C_HEADER;
+    wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
     mvwaddstr(w, 0, 0, focused ? " Threads [s/S:sort  j/k:scroll  Tab:unfocus]" :
                                  " Thread summary");
     if (ui.tid_filter != -1) {
@@ -1098,7 +1104,8 @@ static void draw_threads(WINDOW* w, const UI& ui)
         int si_len = (int)strlen(scroll_info);
         mvwaddstr(w, 0, cols - si_len, scroll_info);
     }
-    hline_to_eol(w, 0, C_HEADER);
+    hline_to_eol(w, 0, hdr_cp);
+    wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
 
     // Column header — active sort column: only label text + arrow underlined.
     // Fixed non-name portion: 2+7(TID)+2+10+2+10+2+10+2+16(leaks) = 63 chars.
@@ -1122,6 +1129,7 @@ static void draw_threads(WINDOW* w, const UI& ui)
     };
 
     // Name column (variable width)
+    wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
     mvwaddstr(w, 1, 0, " ");
     if (ui.thread_sort == TS_NAME) {
         wattron(w, A_UNDERLINE);
