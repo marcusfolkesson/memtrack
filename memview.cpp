@@ -527,6 +527,8 @@ struct UI {
     vector<LeakGroup> groups;                // populated when group_mode==true
     uint64_t       lifetime_min_us = 0;      // 0 = disabled; hide allocations younger than this
     string         search_str;               // empty = disabled; case-insensitive substring filter
+    bool           delta_mode  = false;      // show only allocations after mark_ts
+    uint64_t       mark_ts     = 0;          // timestamp of mark point (µs)
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -551,6 +553,8 @@ struct UI {
                 uint64_t age = (max_ts >= r.timestamp_us) ? (max_ts - r.timestamp_us) : 0;
                 if (age < lifetime_min_us) continue;
             }
+            // Delta filter: only show allocations that appeared after the mark point
+            if (delta_mode && r.timestamp_us <= mark_ts) continue;
             // Symbol search: case-insensitive substring across frames, thread, op, ptr
             if (!search_str.empty()) {
                 auto ci_contains = [&](const string& haystack) {
@@ -794,6 +798,14 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
               sort_label[ui.sort],
               ui.sort_rev ? " ▲" : " ▼",
               leaks, fmt_size(leak_bytes).c_str());
+    if (ui.delta_mode) {
+        // Highlight the delta marker prominently so it's impossible to miss
+        wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+        wattron(w, COLOR_PAIR(C_FREE) | A_BOLD);
+        wprintw(w, "  │  ▶ DELTA since %s", fmt_time_ms(ui.mark_ts).c_str());
+        wattroff(w, COLOR_PAIR(C_FREE) | A_BOLD);
+        wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    }
     if (!ui.search_str.empty()) {
         wprintw(w, "  │  Search: %s", ui.search_str.c_str());
     }
@@ -1294,7 +1306,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  a:age  /:search  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
+                  " q:quit  f:filter  a:age  /:search  m:mark/delta  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1732,6 +1744,27 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         if (ch == '/') {
             string s = prompt_input(win.status, "Search (frames/thread/op, empty=clear): ");
             ui.search_str = s;
+            ui.rebuild();
+            goto next_draw;
+        }
+
+        // Mark / delta mode: 'm' sets mark at current max timestamp and shows
+        // only allocations that appear after it.  Press again to clear.
+        if (ch == 'm') {
+            if (ui.delta_mode) {
+                // Clear mark
+                ui.delta_mode = false;
+                ui.mark_ts    = 0;
+            } else {
+                // Set mark at the latest timestamp across all records
+                uint64_t max_ts = 0;
+                for (const auto& r : ui.ps->records) {
+                    max_ts = max(max_ts, r.timestamp_us);
+                    if (r.freed) max_ts = max(max_ts, r.free_timestamp_us);
+                }
+                ui.mark_ts   = max_ts;
+                ui.delta_mode = true;
+            }
             ui.rebuild();
             goto next_draw;
         }
