@@ -1026,8 +1026,10 @@ static void draw_threads(WINDOW* w, const UI& ui)
     hline_to_eol(w, 0, C_HEADER);
 
     // Column header
-    int name_w = max(8, cols - 52);
-    mvwprintw(w, 1, 0, " %-*s  %6s  %10s  %10s  %10s  %s",
+    // Fixed non-name portion: 2+7(TID)+2+10+2+10+2+10+2+16(leaks) = 63 chars.
+    // Reserve 1 leading space → name_w = cols - 64.
+    int name_w = max(8, cols - 64);
+    mvwprintw(w, 1, 0, " %-*s  %7s  %10s  %10s  %10s  %-16s",
               name_w, "Thread", "TID", "Allocated", "Freed", "Net(live)", "Leaks");
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
@@ -1054,7 +1056,7 @@ static void draw_threads(WINDOW* w, const UI& ui)
                      t.leak_count, fmt_size(t.leak_bytes).c_str());
 
         wattron(w, COLOR_PAIR(cp) | attr);
-        mvwprintw(w, i + 2, 0, " %-*.*s  %6d  %10s  %10s  %10s  %s",
+        mvwprintw(w, i + 2, 0, " %-*.*s  %7d  %10s  %10s  %10s  %-16s",
                   name_w, name_w, t.name.c_str(),
                   t.tid,
                   fmt_size(t.allocated).c_str(),
