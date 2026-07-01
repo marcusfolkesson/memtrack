@@ -94,6 +94,8 @@ static __thread size_t thread_total = 0;
 static __thread bool   key_set      = false;
 static __thread bool   name_cached  = false;          // separate from thread_name content
 static __thread char   thread_name[16] = {};          // max 15 chars + NUL
+// Per-thread frame-filter result: -1=not yet checked, 0=no frames, 1=capture frames
+static __thread int    frames_enabled = -1;
 
 static const char* get_thread_name();  // forward declaration
 static void log_free(void*, const char*); // forward declaration
@@ -107,6 +109,13 @@ static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socke
 static size_t g_min_size       = 0;
 static int    g_stack_depth    = 0;       // 0 = stack traces disabled
 static size_t g_buffer_size    = 4096;    // per-thread write buffer (PIPE_BUF); 0 = unbuffered
+
+// Thread-name filter for stack traces.  If non-empty, only threads whose name
+// contains one of the substrings (case-sensitive) capture frames.
+// Parsed from MEMTRACK_STACK_THREADS=name1,name2,...
+static char   g_stack_threads[512]   = {};     // raw copy of the env value
+static char*  g_stack_tnames[64]     = {};     // pointers into g_stack_threads
+static int    g_stack_tname_count    = 0;      // 0 = no filter (all threads)
 
 // Per-thread output buffer.  Used when g_buffer_size > 0.
 // Allocated lazily with real_malloc to avoid tracking the buffer itself.
@@ -323,6 +332,20 @@ static void __attribute__((constructor)) memtrack_ctor()
         }
         g_buffer_size = (size_t)v;
     }
+
+    const char* sthr = getenv("MEMTRACK_STACK_THREADS");
+    if (sthr && *sthr) {
+        // Copy into g_stack_threads and split on commas.
+        strncpy(g_stack_threads, sthr, sizeof(g_stack_threads) - 1);
+        char* p = g_stack_threads;
+        while (*p && g_stack_tname_count < 64) {
+            g_stack_tnames[g_stack_tname_count++] = p;
+            char* comma = strchr(p, ',');
+            if (!comma) break;
+            *comma = '\0';
+            p = comma + 1;
+        }
+    }
 }
 
 static inline void ensure_exit_hook()
@@ -348,6 +371,37 @@ static const char* get_thread_name()
         name_cached = true;
     }
     return thread_name;
+}
+
+// Returns true if the current thread should capture stack frames.
+// Result is cached per-thread after the name is established.
+// Re-evaluates if the name was not yet set when last checked (empty string).
+static bool thread_wants_frames()
+{
+    if (g_stack_depth == 0) return false;
+
+    // Re-check if not yet resolved or if name was empty last time.
+    if (frames_enabled < 0 || (frames_enabled == 0 && !name_cached)) {
+        if (g_stack_tname_count == 0) {
+            // No filter: all threads capture frames.
+            frames_enabled = 1;
+        } else {
+            const char* name = get_thread_name();
+            frames_enabled = 0;
+            if (name[0] != '\0') {
+                for (int i = 0; i < g_stack_tname_count; i++) {
+                    if (strstr(name, g_stack_tnames[i])) {
+                        frames_enabled = 1;
+                        break;
+                    }
+                }
+            }
+            // If name is still empty we leave frames_enabled=0 and
+            // allow re-evaluation next call (name not established yet).
+            if (name[0] == '\0') frames_enabled = -1;
+        }
+    }
+    return frames_enabled == 1;
 }
 
 // Write an event line + optional stack frames as a single atomic write().
@@ -414,7 +468,7 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 
     void* frames[68]; // g_stack_depth max=64 + up to 3 skip frames + 1 spare
     int   frame_count = 0;
-    if (g_stack_depth > 0) {
+    if (thread_wants_frames()) {
         // Skip 2: log_alloc + the hook (malloc/calloc/new/etc.).
         // cpp_alloc is always_inline so it adds no frame.
         const int skip  = 2;
@@ -448,7 +502,7 @@ static bool log_free_capture(void* ptr, const char* op,
 
     void* frames[68]; // g_stack_depth max=64 + up to 3 skip frames + 1 spare
     int   frame_count = 0;
-    if (g_stack_depth > 0) {
+    if (thread_wants_frames()) {
         const int total = g_stack_depth + skip;
         int raw = backtrace(frames, total < 68 ? total : 68);
         frame_count = (raw > skip) ? raw - skip : 0;

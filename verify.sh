@@ -419,7 +419,52 @@ else
     fail "T21: malloc(21021) not found — cannot do corruption check"
 fi
 
-# ── Final summary ─────────────────────────────────────────────────────────────
+# ── TEST 22: MEMTRACK_STACK_THREADS filter ────────────────────────────────────
+# Run test_app again with STACK_THREADS set to only "t22thread" (a name that
+# matches no thread in the app).  No alloc events should have any frame lines.
+# Then run again with STACK_THREADS matching "test_app" (the main thread name).
+echo ""; echo "TEST 22: MEMTRACK_STACK_THREADS filter"
+
+MT22_NONE=$(dirname "$LOG")/mt22_none.log
+MT22_MAIN=$(dirname "$LOG")/mt22_main.log
+
+# Run 1: thread name that matches nothing → zero frame lines in entire log
+LD_PRELOAD=./memtrack.so \
+    MEMTRACK_STACK_DEPTH=16 \
+    MEMTRACK_STACK_THREADS=no_such_thread \
+    ./test_app >"$MT22_NONE.stdout" 2>"$MT22_NONE" || true
+
+frames_none=$(grep -cP '^\[memtrack\]   #' "$MT22_NONE" 2>/dev/null || true)
+if [[ "$frames_none" -eq 0 ]]; then
+    pass "T22: STACK_THREADS=no_such_thread → 0 frame lines (filter suppresses all)"
+else
+    fail "T22: STACK_THREADS=no_such_thread → $frames_none unexpected frame lines"
+fi
+
+# Run 2: thread name "test_app" matches the main thread → frame lines present
+LD_PRELOAD=./memtrack.so \
+    MEMTRACK_STACK_DEPTH=16 \
+    MEMTRACK_STACK_THREADS=test_app \
+    ./test_app >"$MT22_MAIN.stdout" 2>"$MT22_MAIN" || true
+
+frames_main=$(grep -cP '^\[memtrack\]   #' "$MT22_MAIN" 2>/dev/null || true)
+# Allocs logged for non-matching threads (t15-alloc, t16-leak, t17-wN, …) must
+# have NO frame lines — spot-check t17-w1 allocs.
+t17_frames=$(grep -A1 "(t17-w1" "$MT22_MAIN" | grep -cP '^\[memtrack\]   #' || true)
+if [[ "$frames_main" -gt 0 ]]; then
+    pass "T22: STACK_THREADS=test_app → $frames_main frame lines for main thread"
+else
+    fail "T22: STACK_THREADS=test_app → 0 frame lines, expected some for main"
+fi
+if [[ "$t17_frames" -eq 0 ]]; then
+    pass "T22: t17-w1 thread (not in filter) has no frame lines"
+else
+    fail "T22: t17-w1 thread unexpectedly has $t17_frames frame lines"
+fi
+
+rm -f "$MT22_NONE" "$MT22_NONE.stdout" "$MT22_MAIN" "$MT22_MAIN.stdout"
+
+
 echo ""
 echo "══════════════════════════════════════════════════════════════"
 printf "  Total: \033[32m%d passed\033[0m, \033[31m%d failed\033[0m\n" "$PASS" "$FAIL"
