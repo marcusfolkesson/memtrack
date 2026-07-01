@@ -301,7 +301,8 @@ struct LiveReader {
             pos = 0;
             // Make stdin non-blocking so poll_new() can return quickly.
             int flags = fcntl(fileno(stdin), F_GETFL, 0);
-            fcntl(fileno(stdin), F_SETFL, flags | O_NONBLOCK);
+            if (flags != -1)
+                fcntl(fileno(stdin), F_SETFL, flags | O_NONBLOCK);
         } else {
             fp  = fopen(p.c_str(), "r");
             pos = initial_pos;
@@ -329,8 +330,11 @@ struct LiveReader {
         if (!ok) { if (sock >= 0) close(sock); return false; }
 
         // Non-blocking so poll_new() can return between polls.
-        fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
-        fp          = fdopen(sock, "r");
+        int flags = fcntl(sock, F_GETFL, 0);
+        if (flags != -1)
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        fp = fdopen(sock, "r");
+        if (!fp) { close(sock); return false; }
         is_socket   = true;
         is_stdin    = false;
         disconnected = false;
@@ -362,9 +366,11 @@ struct LiveReader {
         } else {
             // Detect file truncation: current end is before our read position.
             long saved = ftell(fp);
+            if (saved < 0) return false;  // seek error, skip truncation check
             fseek(fp, 0, SEEK_END);
             long cur_end = ftell(fp);
             fseek(fp, saved, SEEK_SET);
+            if (cur_end < 0) return false;  // seek error
 
             if (cur_end < pos) {
                 // File was truncated — clear state and restart from top.
@@ -531,9 +537,10 @@ static string fmt_time_ms(uint64_t us)
 {
     char buf[32];
     double ms = us / 1000.0;
-    if (ms >= 60000.0)
-        snprintf(buf, sizeof(buf), "%.3fs",  ms / 1000.0);
-    else if (ms >= 1000.0)
+    if (ms >= 60000.0) {
+        int mins = (int)(ms / 60000.0);
+        snprintf(buf, sizeof(buf), "%dm%.3fs", mins, (ms - mins * 60000.0) / 1000.0);
+    } else if (ms >= 1000.0)
         snprintf(buf, sizeof(buf), "%.3fs",  ms / 1000.0);
     else
         snprintf(buf, sizeof(buf), "%.3fms", ms);
@@ -619,7 +626,6 @@ static void draw_list(WINDOW* w, const UI& ui)
     werase(w);
 
     // Sub-header — underline active sort column
-    werase(w);
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
     mvwaddstr(w, 0, 0, " St. ");
     waddstr(w, "Pointer            ");
@@ -661,8 +667,11 @@ static void draw_list(WINDOW* w, const UI& ui)
                   status, ptr_buf, r.op.c_str(),
                   fmt_time_ms(r.timestamp_us).c_str(),
                   sz.c_str(), r.thread_name.c_str());
-        int x = getcurx(w);
-        while (x < cols) { waddch(w, ' '); x++; }
+        // Only fill to EOL if the cursor did not wrap to the next row.
+        if (getcury(w) == row + 1) {
+            int x = getcurx(w);
+            while (x < cols) { waddch(w, ' '); x++; }
+        }
         wattroff(w, COLOR_PAIR(cp) | attr);
     }
 
@@ -711,16 +720,23 @@ static const string& resolve_addr2line(const string& frame)
     //   sym_part = "funcname+0xOFFSET" → look up funcname in nm, add offset - 1.
     // The -1 is needed because backtrace() records the return address (instruction
     // after CALL), and we want to point inside the CALL for correct source mapping.
+    //
+    // Validate rt_addr is a pure hex number before using it in a shell command.
+    // A crafted frame with rt_addr = "; evil_cmd" would otherwise be injected.
+    if (rt_addr.size() < 3 || rt_addr.substr(0, 2) != "0x") return result;
+    for (char c : rt_addr.substr(2))
+        if (!isxdigit((unsigned char)c)) return result;
+
     string resolve_addr;
     {
         uint64_t raw = 0;
-        try { raw = stoull(rt_addr, nullptr, 16); } catch (...) {}
+        try { raw = stoull(rt_addr, nullptr, 16); } catch (...) { return result; }
         if (raw > 0) {
             char buf[32];
             snprintf(buf, sizeof(buf), "0x%lx", raw - 1);
             resolve_addr = buf;
         } else {
-            resolve_addr = rt_addr;
+            return result;  // null pointer — nothing useful to resolve
         }
     }
 
@@ -732,9 +748,19 @@ static const string& resolve_addr2line(const string& frame)
         try { offset = stoull(offstr, nullptr, 16); } catch (...) {}
 
         if (!sym.empty() && !nm_cache.count(module)) {
-            // Populate nm symbol table for this module
+            // Populate nm symbol table for this module.
+            // Quote module path with single-quotes; escape any embedded single-quote.
+            string qmod = module;
+            {
+                string escaped;
+                for (char c : qmod) {
+                    if (c == '\'') escaped += "'\\''";
+                    else           escaped += c;
+                }
+                qmod = "'" + escaped + "'";
+            }
             unordered_map<string, uint64_t> syms;
-            string nm_cmd = "nm -D " + module + " 2>/dev/null; nm " + module + " 2>/dev/null";
+            string nm_cmd = "nm -D " + qmod + " 2>/dev/null; nm " + qmod + " 2>/dev/null";
             FILE* nfp = popen(nm_cmd.c_str(), "r");
             if (nfp) {
                 char buf[512];
@@ -748,20 +774,37 @@ static const string& resolve_addr2line(const string& frame)
             nm_cache[module] = std::move(syms);
         }
 
-        auto& syms = nm_cache[module];
-        auto sit = syms.find(sym);
-        if (sit != syms.end()) {
-            char buf[32];
-            // Subtract 1: backtrace gives the return address (instruction after
-            // the call), so -1 puts us inside the CALL instruction itself,
-            // which addr2line maps to the correct calling source line.
-            snprintf(buf, sizeof(buf), "0x%lx", sit->second + offset - 1);
-            resolve_addr = buf;
+        // Only look up the symbol if we have a name AND the module was populated.
+        // Using find() avoids operator[] which would default-insert an empty map
+        // and permanently block future population for the same module.
+        if (!sym.empty()) {
+            auto mc = nm_cache.find(module);
+            if (mc != nm_cache.end()) {
+                auto sit = mc->second.find(sym);
+                if (sit != mc->second.end()) {
+                    char buf[32];
+                    // Subtract 1: backtrace gives the return address (instruction after
+                    // the call), so -1 puts us inside the CALL instruction itself,
+                    // which addr2line maps to the correct calling source line.
+                    snprintf(buf, sizeof(buf), "0x%lx", sit->second + offset - 1);
+                    resolve_addr = buf;
+                }
+            }
         }
     }
 
     // addr2line -e <module> -f -s -C -i <addr>
-    string cmd = "addr2line -e " + module + " -f -s -C -i " + resolve_addr + " 2>/dev/null";
+    // Quote module path to handle spaces and special characters.
+    string qmod_a2l = module;
+    {
+        string escaped;
+        for (char c : qmod_a2l) {
+            if (c == '\'') escaped += "'\\''";
+            else           escaped += c;
+        }
+        qmod_a2l = "'" + escaped + "'";
+    }
+    string cmd = "addr2line -e " + qmod_a2l + " -f -s -C -i " + resolve_addr + " 2>/dev/null";
     FILE* fp = popen(cmd.c_str(), "r");
     if (!fp) return result;
 
@@ -874,8 +917,12 @@ static void draw_detail(WINDOW* w, const UI& ui)
     auto detail  = build_detail(*r, ui.resolve_lines);
     int  visible = rows - 2;    // -1 header -1 scrollbar
 
+    // Clamp detail_top (INT_MAX is used as "jump to bottom" sentinel).
+    int max_top = max(0, (int)detail.size() - visible);
+    int dtop    = min(ui.detail_top, max_top);
+
     for (int row = 0; row < visible; row++) {
-        int di = ui.detail_top + row;
+        int di = dtop + row;
         if (di >= (int)detail.size()) break;
         const auto& dl = detail[di];
         wattron(w, COLOR_PAIR(dl.cp) | dl.attr);
@@ -887,7 +934,7 @@ static void draw_detail(WINDOW* w, const UI& ui)
     if ((int)detail.size() > visible) {
         wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
         mvwprintw(w, rows - 1, 0, " line %d / %d ",
-                  ui.detail_top + 1, (int)detail.size());
+                  dtop + 1, (int)detail.size());
         hline_to_eol(w, rows - 1, C_DIM);
         wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
     }
@@ -1038,7 +1085,7 @@ static int threads_pane_h(int n_threads)
 // detail pane always gets at least 30 columns.
 static int list_pane_w() { return (COLS >= LIST_W + 30) ? LIST_W : COLS / 2; }
 // Body height: total rows minus header(2), thread pane, and status(2).
-static int body_height(int th_h)  { return LINES - 2 - th_h - 2; }
+static int body_height(int th_h)  { return max(BODY_MIN, LINES - 2 - th_h - 2); }
 
 static Windows make_windows(int th_h)
 {
