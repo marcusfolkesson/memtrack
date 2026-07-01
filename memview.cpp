@@ -460,6 +460,7 @@ enum {
     C_THREAD    = 8,  // cyan / black   (thread info)
     C_FOCUS_HDR = 9,  // black / cyan   (focused pane title bar)
     C_GROUP     = 10, // magenta / black (grouped entries)
+    C_TIMELINE  = 11, // white / black   (timeline bar background)
 };
 
 static void init_colors()
@@ -476,6 +477,7 @@ static void init_colors()
     init_pair(C_THREAD,    COLOR_CYAN,   COLOR_BLACK);
     init_pair(C_FOCUS_HDR, COLOR_BLACK,   COLOR_CYAN);
     init_pair(C_GROUP,     COLOR_MAGENTA, COLOR_BLACK);
+    init_pair(C_TIMELINE,  COLOR_WHITE,   COLOR_BLACK);
 }
 
 // ─── UI state ────────────────────────────────────────────────────────────────
@@ -529,6 +531,7 @@ struct UI {
     string         search_str;               // empty = disabled; case-insensitive substring filter
     bool           delta_mode  = false;      // show only allocations after mark_ts
     uint64_t       mark_ts     = 0;          // timestamp of mark point (µs)
+    bool           show_timeline = true;     // show sparkline timeline in header
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -817,6 +820,96 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
     }
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+
+    // Row 2: timeline sparkline (toggle with 'T')
+    if (ui.show_timeline) {
+        static const wchar_t bars[] = L" ▁▂▃▄▅▆▇█";
+        int height, cols_; getmaxyx(w, height, cols_); (void)height;
+        int tw = cols_ - 2;  // usable width for sparkline
+
+        const auto& recs = ui.ps->records;
+        // Filter to selected thread when a thread filter is active
+        int tid_f = ui.tid_filter;
+        // Count matching records to detect empty
+        bool any = false;
+        for (const auto& r : recs) if (tid_f == -1 || r.tid == tid_f) { any = true; break; }
+
+        if (tw > 4 && any) {
+            // Find time range for the selected thread (or all)
+            uint64_t t_min = UINT64_MAX, t_max = 0;
+            for (const auto& r : recs) {
+                if (tid_f != -1 && r.tid != tid_f) continue;
+                t_min = min(t_min, r.timestamp_us);
+                t_max = max(t_max, r.timestamp_us);
+                if (r.freed) t_max = max(t_max, r.free_timestamp_us);
+            }
+            uint64_t span = max<uint64_t>(1, t_max - t_min);
+
+            // Bucket: net live bytes per column cell
+            vector<int64_t> net(tw, 0);
+            for (const auto& r : recs) {
+                if (tid_f != -1 && r.tid != tid_f) continue;
+                int col = (int)(((r.timestamp_us - t_min) * (uint64_t)tw) / (span + 1));
+                col = max(0, min(tw - 1, col));
+                net[col] += (int64_t)r.size;
+                if (r.freed) {
+                    int fc = (int)(((r.free_timestamp_us - t_min) * (uint64_t)tw) / (span + 1));
+                    fc = max(0, min(tw - 1, fc));
+                    net[fc] -= (int64_t)r.size;
+                }
+            }
+
+            // Running live bytes and peak
+            int64_t peak = 1;
+            vector<int64_t> live(tw, 0);
+            int64_t running = 0;
+            for (int i = 0; i < tw; i++) { running += net[i]; live[i] = running; peak = max(peak, running); }
+
+            // Left label: thread name if filtered
+            if (tid_f != -1) {
+                string tname;
+                for (const auto& t : ui.ps->threads)
+                    if (t.tid == tid_f) { tname = t.name; break; }
+                wattron(w, COLOR_PAIR(C_THREAD));
+                mvwprintw(w, 2, 0, " [%s] ", tname.empty() ? "?" : tname.c_str());
+                wattroff(w, COLOR_PAIR(C_THREAD));
+                int used = 2 + (int)tname.size() + 3;
+                tw = max(1, cols_ - used - (int)strlen(" 0.000s"));
+                mvwaddstr(w, 2, used, "");
+            } else {
+                mvwaddstr(w, 2, 0, " ");
+            }
+
+            for (int i = 0; i < tw; i++) {
+                int64_t v = max<int64_t>(0, live[i]);
+                int lvl = (int)(v * 8 / peak);
+                lvl = max(0, min(8, lvl));
+                bool growing = net[i] >= 0;
+                // Delta mark column
+                if (ui.delta_mode && ui.mark_ts > t_min) {
+                    int mark_col = (int)(((ui.mark_ts - t_min) * (uint64_t)tw) / (span + 1));
+                    if (i == min(tw - 1, mark_col)) {
+                        wattron(w, COLOR_PAIR(C_LEAK) | A_BOLD);
+                        waddch(w, '|');
+                        wattroff(w, COLOR_PAIR(C_LEAK) | A_BOLD);
+                        continue;
+                    }
+                }
+                cchar_t cc;
+                wchar_t wch[2] = { bars[lvl], 0 };
+                setcchar(&cc, wch, A_NORMAL, (short)(growing ? C_ALLOC : C_FREE), nullptr);
+                wadd_wch(w, &cc);
+            }
+            // Right label: total span
+            char span_label[32];
+            snprintf(span_label, sizeof(span_label), " %s", fmt_time_ms(span).c_str());
+            mvwaddstr(w, 2, cols_ - (int)strlen(span_label), span_label);
+        } else {
+            mvwaddstr(w, 2, 0, " (no data)");
+        }
+        hline_to_eol(w, 2, C_NORMAL);
+    }
+
     wrefresh(w);
 }
 
@@ -1306,7 +1399,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  a:age  /:search  m:mark  W:export  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src%s",
+                  " q:quit  f:filter  a:age  /:search  m:mark  W:export  Z:timeline  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1480,19 +1573,22 @@ static int threads_pane_h(int n_threads)
 // Actual list pane width — shrinks to half on very narrow terminals so the
 // detail pane always gets at least 30 columns.
 static int list_pane_w() { return (COLS >= LIST_W + 30) ? LIST_W : COLS / 2; }
-// Body height: total rows minus header(2), thread pane, and status(1).
-static int body_height(int th_h)  { return max(BODY_MIN, LINES - 2 - th_h - 1); }
+// Header height: 2 fixed rows + optional timeline row.
+static int header_h(bool show_timeline) { return show_timeline ? 3 : 2; }
+// Body height: total rows minus header, thread pane, and status(1).
+static int body_height(int th_h, bool show_timeline) { return max(BODY_MIN, LINES - header_h(show_timeline) - th_h - 1); }
 
-static Windows make_windows(int th_h)
+static Windows make_windows(int th_h, bool show_timeline)
 {
     int rows = LINES, cols = COLS;
     int lw      = list_pane_w();
-    int body    = body_height(th_h);
-    int th_y    = 2 + body;
+    int hh      = header_h(show_timeline);
+    int body    = body_height(th_h, show_timeline);
+    int th_y    = hh + body;
     return {
-        newwin(2,    cols,      0,    0),
-        newwin(body, lw,        2,    0),
-        newwin(body, cols-lw-1, 2,    lw+1),
+        newwin(hh,   cols,      0,    0),
+        newwin(body, lw,        hh,   0),
+        newwin(body, cols-lw-1, hh,   lw+1),
         newwin(th_h, cols,      th_y, 0),
         newwin(1,    cols,      rows-1, 0),
     };
@@ -1626,22 +1722,23 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
     // without starving keyboard input.
     if (live) wtimeout(stdscr, 50);
 
-    Windows win = make_windows(threads_pane_h((int)ps.threads.size()));
+    Windows win = make_windows(threads_pane_h((int)ps.threads.size()), ui.show_timeline);
     int win_thread_count = (int)ps.threads.size(); // track for dynamic resize
 
     auto rebuild_windows = [&]() {
         int th_h = threads_pane_h((int)ps.threads.size());
         free_windows(win);
         clear(); refresh();
-        win = make_windows(th_h);
+        win = make_windows(th_h, ui.show_timeline);
         win_thread_count = (int)ps.threads.size();
     };
 
     auto redraw = [&]() {
         int th_h = threads_pane_h((int)ps.threads.size());
         int lw = list_pane_w();
+        int hh = header_h(ui.show_timeline);
         attron(COLOR_PAIR(C_DIM) | A_DIM);
-        mvvline(2, lw, ACS_VLINE, body_height(th_h));
+        mvvline(hh, lw, ACS_VLINE, body_height(th_h, ui.show_timeline));
         attroff(COLOR_PAIR(C_DIM) | A_DIM);
         refresh();
         draw_header(win.header, ui, filename, reader);
@@ -1865,6 +1962,13 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             ui.list_top   = 0;
             ui.detail_top = 0;
             if (ui.group_mode) ui.rebuild_groups();
+            goto next_draw;
+        }
+
+        // Toggle timeline sparkline row in header
+        if (ch == 'Z') {
+            ui.show_timeline = !ui.show_timeline;
+            rebuild_windows();
             goto next_draw;
         }
 
