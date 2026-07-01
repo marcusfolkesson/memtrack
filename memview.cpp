@@ -482,7 +482,7 @@ enum SortMode  { S_TIME, S_SIZE, S_THREAD, S_COUNT };
 static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
 
-enum ThreadSortMode { TS_NET, TS_NAME, TS_ALLOC, TS_FREED, TS_LEAKS };
+enum ThreadSortMode { TS_NET, TS_NAME, TS_TID, TS_ALLOC, TS_FREED, TS_LEAKS };
 
 struct UI {
     ParseState*    ps           = nullptr;
@@ -663,20 +663,32 @@ static void draw_list(WINDOW* w, const UI& ui)
     int rows, cols; getmaxyx(w, rows, cols);
     werase(w);
 
-    // Sub-header — underline active sort column
+    // Sub-header — underline active sort column label only (no trailing spaces)
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
     mvwaddstr(w, 0, 0, " St. ");
     waddstr(w, "Pointer            ");
     waddstr(w, "Op         ");
 
-    auto col = [&](const char* label, SortMode sm) {
-        if (ui.sort == sm) wattron(w, A_UNDERLINE);
-        waddstr(w, label);
-        if (ui.sort == sm) wattroff(w, A_UNDERLINE);
+    // col: print label with underline + arrow on active column, plain otherwise.
+    // pad is the total field width including label, arrow, and trailing spaces.
+    auto col = [&](const char* label, SortMode sm, int pad) {
+        int label_len = (int)strlen(label);
+        if (ui.sort == sm) {
+            wattron(w, A_UNDERLINE);
+            waddstr(w, label);
+            waddstr(w, ui.sort_rev ? "▲" : "▼");
+            wattroff(w, A_UNDERLINE);
+            // fill remaining width without underline
+            int used = label_len + 1;
+            for (int i = used; i < pad; i++) waddch(w, ' ');
+        } else {
+            waddstr(w, label);
+            for (int i = label_len; i < pad; i++) waddch(w, ' ');
+        }
     };
-    col("Time        ", S_TIME);
-    col("Size       ", S_SIZE);
-    col("Thread",       S_THREAD);
+    col("Time",   S_TIME,   12);
+    col("Size",   S_SIZE,   11);
+    col("Thread", S_THREAD,  6);
 
     hline_to_eol(w, 0, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
@@ -1042,6 +1054,7 @@ static vector<const ThreadInfo*> sorted_threads(const UI& ui)
         bool less = false;
         switch (ui.thread_sort) {
             case TS_NAME:  less = a->name < b->name; break;
+            case TS_TID:   less = a->tid  < b->tid;  break;
             case TS_ALLOC: less = a->allocated > b->allocated; break;
             case TS_FREED: less = a->freed     > b->freed;     break;
             case TS_LEAKS: less = a->leak_bytes > b->leak_bytes; break;
@@ -1087,37 +1100,49 @@ static void draw_threads(WINDOW* w, const UI& ui)
     }
     hline_to_eol(w, 0, C_HEADER);
 
-    // Column header — active sort column is underlined.
+    // Column header — active sort column: only label text + arrow underlined.
     // Fixed non-name portion: 2+7(TID)+2+10+2+10+2+10+2+16(leaks) = 63 chars.
     // Reserve 1 leading space → name_w = cols - 64.
     int name_w = max(8, cols - 64);
-    const char* arrow = ui.thread_sort_rev ? " ▲" : " ▼";
 
-    auto col = [&](ThreadSortMode m, const char* label, int w2) {
+    // col_hdr: print a fixed-width column header.  Only the label text and the
+    // sort arrow are underlined — trailing padding spaces are not.
+    auto col_hdr = [&](ThreadSortMode m, const char* label, int w2) {
         bool active = (ui.thread_sort == m);
-        if (active) wattron(w, A_UNDERLINE);
-        wprintw(w, active ? (ui.thread_sort_rev ? "%-*s▲" : "%-*s▼") : "%-*s ",
-                w2 - 1, label);
-        if (active) wattroff(w, A_UNDERLINE);
+        if (active) {
+            wattron(w, A_UNDERLINE);
+            waddstr(w, label);
+            waddstr(w, ui.thread_sort_rev ? "▲" : "▼");
+            wattroff(w, A_UNDERLINE);
+            int used = (int)strlen(label) + 1; // +1 for the arrow (single char)
+            wprintw(w, "%-*s", max(0, w2 - used), "");
+        } else {
+            wprintw(w, "%-*s ", w2 - 1, label);
+        }
     };
-    (void)arrow;
 
-    wmove(w, 1, 0);
-    wprintw(w, " ");
     // Name column (variable width)
-    if (ui.thread_sort == TS_NAME) wattron(w, A_UNDERLINE);
-    wprintw(w, ui.thread_sort == TS_NAME
-               ? (ui.thread_sort_rev ? "%-*s▲" : "%-*s▼")
-               : "%-*s ", name_w - 1, "Thread");
-    if (ui.thread_sort == TS_NAME) wattroff(w, A_UNDERLINE);
-    wprintw(w, "  %7s  ", "TID");
-    col(TS_ALLOC, "Allocated", 10);
+    mvwaddstr(w, 1, 0, " ");
+    if (ui.thread_sort == TS_NAME) {
+        wattron(w, A_UNDERLINE);
+        waddstr(w, "Thread");
+        waddstr(w, ui.thread_sort_rev ? "▲" : "▼");
+        wattroff(w, A_UNDERLINE);
+        int used = 7; // strlen("Thread")+1 for arrow
+        wprintw(w, "%-*s", max(0, name_w - used), "");
+    } else {
+        wprintw(w, "%-*s ", name_w - 1, "Thread");
+    }
     wprintw(w, "  ");
-    col(TS_FREED, "Freed", 10);
+    col_hdr(TS_TID, "TID", 7);
     wprintw(w, "  ");
-    col(TS_NET, "Net(live)", 10);
+    col_hdr(TS_ALLOC, "Allocated", 10);
     wprintw(w, "  ");
-    col(TS_LEAKS, "Leaks", 16);
+    col_hdr(TS_FREED, "Freed", 10);
+    wprintw(w, "  ");
+    col_hdr(TS_NET, "Net(live)", 10);
+    wprintw(w, "  ");
+    col_hdr(TS_LEAKS, "Leaks", 16);
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
@@ -1474,7 +1499,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             else if (ch == 'G') ui.hotfn_top = max_top;
             else if (ch == 's') {
                 // Cycle sort column forward: Net → Name → Allocated → Freed → Leaks → Net
-                const ThreadSortMode cycle[] = { TS_NAME, TS_ALLOC, TS_FREED, TS_NET, TS_LEAKS };
+                const ThreadSortMode cycle[] = { TS_NAME, TS_TID, TS_ALLOC, TS_FREED, TS_NET, TS_LEAKS };
                 constexpr int N = (int)(sizeof(cycle)/sizeof(cycle[0]));
                 for (int i = 0; i < N; i++) {
                     if (cycle[i] == ui.thread_sort) {
