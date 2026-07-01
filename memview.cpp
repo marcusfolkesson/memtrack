@@ -231,7 +231,16 @@ static void parse_line(const char* line, ParseState& st)
         if (it != st.ptr_idx.end()) {
             auto& rec              = st.records[it->second];
             // Credit the freed bytes back to whoever allocated the memory.
-            st.thread(rec.tid, rec.thread_name).freed += rec.size;
+            auto& alloc_th = st.thread(rec.tid, rec.thread_name);
+            alloc_th.freed += rec.size;
+            // If this was previously reported as a leak (cross-thread free
+            // after exit handler), cancel the leak entry in thread stats.
+            if (rec.is_leak) {
+                rec.is_leak = false;
+                if (alloc_th.leak_count > 0) alloc_th.leak_count--;
+                if (alloc_th.leak_bytes >= rec.size) alloc_th.leak_bytes -= rec.size;
+                else alloc_th.leak_bytes = 0;
+            }
             rec.freed              = true;
             rec.free_tid           = tid;
             rec.free_thread_name   = tname;

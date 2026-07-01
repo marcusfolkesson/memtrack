@@ -27,6 +27,7 @@
 #include <time.h>
 #include <new>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <cstdlib>
 
@@ -150,8 +151,12 @@ struct AllocInfo {
     void*    frames[32];    // raw PCs captured at allocation time
 };
 
-static std::unordered_map<void*, AllocInfo>* g_map  = nullptr;
-static pthread_mutex_t                        g_lock = PTHREAD_MUTEX_INITIALIZER;
+static std::unordered_map<void*, AllocInfo>*  g_map            = nullptr;
+// Pointers reported as LEAK at thread-exit that haven't been freed yet.
+// If thread B later frees one of these, we log the free and remove it here
+// so memview can cancel the false-positive leak entry.
+static std::unordered_map<void*, size_t>*     g_reported_leaks = nullptr;
+static pthread_mutex_t                         g_lock           = PTHREAD_MUTEX_INITIALIZER;
 
 // Record a user allocation.  Caller must have set in_hook = true first.
 static void map_record(void* ptr, size_t size, const char* op,
@@ -218,7 +223,8 @@ static void thread_exit_handler(void*)
         size_t leak_count = 0;
         size_t leak_bytes = 0;
 
-        // First pass: report leaks belonging to this thread.
+        // First pass: report leaks belonging to this thread and register them
+        // in g_reported_leaks so a cross-thread free can cancel the entry.
         for (auto& [ptr, info] : *g_map) {
             if (info.tid != tid) continue;
             ++leak_count;
@@ -230,6 +236,13 @@ static void thread_exit_handler(void*)
             if (n > 0) outfd_write(buf, (size_t)n);
             if (info.frame_count > 0)
                 print_frames(info.frames, info.frame_count);
+
+            if (!g_reported_leaks) {
+                try { g_reported_leaks = new std::unordered_map<void*, size_t>(); } catch (...) {}
+            }
+            if (g_reported_leaks) {
+                try { (*g_reported_leaks)[ptr] = info.size; } catch (...) {}
+            }
         }
 
         // Second pass: erase this thread's entries.
@@ -311,6 +324,13 @@ static void atexit_handler()
             if (n > 0) outfd_write(buf, (size_t)n);
             if (info.frame_count > 0)
                 print_frames(info.frames, info.frame_count);
+
+            if (!g_reported_leaks) {
+                try { g_reported_leaks = new std::unordered_map<void*, size_t>(); } catch (...) {}
+            }
+            if (g_reported_leaks) {
+                try { (*g_reported_leaks)[ptr] = info.size; } catch (...) {}
+            }
         }
 
         if (leak_count > 0) {
@@ -591,6 +611,16 @@ static bool log_free_capture(void* ptr, const char* op,
     if (g_map) {
         auto it = g_map->find(ptr);
         if (it != g_map->end()) { size = it->second.size; tracked = true; }
+    }
+    // Cross-thread free after exit handler: ptr was removed from g_map but
+    // recorded in g_reported_leaks so we can log a cancelling free entry.
+    if (!tracked && g_reported_leaks) {
+        auto it2 = g_reported_leaks->find(ptr);
+        if (it2 != g_reported_leaks->end()) {
+            size    = it2->second;
+            tracked = true;
+            g_reported_leaks->erase(it2);
+        }
     }
     pthread_mutex_unlock(&g_lock);
 
