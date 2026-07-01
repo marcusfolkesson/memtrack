@@ -363,6 +363,62 @@ check_free_op  18018 "delete" "T18: delete (not free) used"
 echo ""; echo "TEST 19: failed realloc safety"
 check_alloc_free 19019 "T19: malloc(19019) freed after failed realloc"
 
+# ── Helper: check that a #0 frame exists within N lines after the alloc line ──
+# Usage: check_frame_after_alloc <size> <search_window> <label>
+check_frame_after_alloc() {
+    local sz="$1" window="$2" label="$3"
+    local entry lno
+    entry=$(first_alloc_entry "$sz")
+    lno=$(echo "$entry" | cut -d' ' -f1)
+    if [[ -z "$lno" ]]; then
+        fail "$label: no alloc for size=$sz found — cannot check frames"
+        return
+    fi
+    local frame
+    frame=$(awk -v s="$lno" -v w="$window" \
+        'NR > s && NR <= s+w && /\[memtrack\]   #0 / {print; exit}' "$LOG")
+    if [[ -n "$frame" ]]; then
+        pass "$label: #0 frame present in stack trace"
+    else
+        fail "$label: #0 frame NOT found within $window lines after alloc (stack traces disabled?)"
+    fi
+}
+
+# ── TEST 20: deep call stack ──────────────────────────────────────────────────
+echo ""; echo "TEST 20: deep call stack"
+check_alloc_free 20020 "T20: malloc(20020) deep stack"
+check_frame_after_alloc 20020 80 "T20"
+# Verify no line in the vicinity has two [memtrack] markers (corruption check).
+lno20=$(first_alloc_entry 20020 | cut -d' ' -f1)
+if [[ -n "$lno20" ]]; then
+    double20=$(awk -v s="$lno20" 'NR >= s && NR <= s+80' "$LOG" \
+               | grep -cP '\[memtrack\].*\[memtrack\]' || true)
+    if [[ "$double20" -eq 0 ]]; then
+        pass "T20: no log corruption around deep-stack event"
+    else
+        fail "T20: log corruption — $double20 lines with two [memtrack] markers"
+    fi
+else
+    fail "T20: malloc(20020) not found — cannot do corruption check"
+fi
+
+# ── TEST 21: long symbol names (heap buffer) ──────────────────────────────────
+echo ""; echo "TEST 21: long symbol names"
+check_alloc_free 21021 "T21: malloc(21021) long template symbols"
+check_frame_after_alloc 21021 80 "T21"
+lno21=$(first_alloc_entry 21021 | cut -d' ' -f1)
+if [[ -n "$lno21" ]]; then
+    double21=$(awk -v s="$lno21" 'NR >= s && NR <= s+80' "$LOG" \
+               | grep -cP '\[memtrack\].*\[memtrack\]' || true)
+    if [[ "$double21" -eq 0 ]]; then
+        pass "T21: no log corruption despite long symbol names"
+    else
+        fail "T21: log corruption — $double21 lines with two [memtrack] markers"
+    fi
+else
+    fail "T21: malloc(21021) not found — cannot do corruption check"
+fi
+
 # ── Final summary ─────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════════"

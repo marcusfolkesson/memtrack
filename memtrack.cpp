@@ -412,14 +412,14 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 
     uint64_t ts = elapsed_us();
 
-    void* frames[32];
+    void* frames[68]; // g_stack_depth max=64 + up to 3 skip frames + 1 spare
     int   frame_count = 0;
     if (g_stack_depth > 0) {
         // Skip 2: log_alloc + the hook (malloc/calloc/new/etc.).
         // cpp_alloc is always_inline so it adds no frame.
         const int skip  = 2;
         const int total = g_stack_depth + skip;
-        int raw = backtrace(frames, total < 32 ? total : 32);
+        int raw = backtrace(frames, total < 68 ? total : 68);
         frame_count = (raw > skip) ? raw - skip : 0;
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
@@ -446,11 +446,11 @@ static bool log_free_capture(void* ptr, const char* op,
 
     uint64_t ts = elapsed_us();
 
-    void* frames[32];
+    void* frames[68]; // g_stack_depth max=64 + up to 3 skip frames + 1 spare
     int   frame_count = 0;
     if (g_stack_depth > 0) {
         const int total = g_stack_depth + skip;
-        int raw = backtrace(frames, total < 32 ? total : 32);
+        int raw = backtrace(frames, total < 68 ? total : 68);
         frame_count = (raw > skip) ? raw - skip : 0;
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }

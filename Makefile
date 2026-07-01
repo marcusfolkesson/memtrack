@@ -17,7 +17,7 @@ test_app: test_app.cpp
 
 test: memtrack.so test_app
 	@echo "Running test_app..."
-	@LD_PRELOAD=./memtrack.so ./test_app 2>mt.log; \
+	@LD_PRELOAD=./memtrack.so MEMTRACK_STACK_DEPTH=64 ./test_app 2>mt.log; \
 	app_exit=$$?; \
 	if [ $$app_exit -ne 0 ]; then \
 		echo "FAIL: test_app exited with code $$app_exit"; \

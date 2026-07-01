@@ -470,6 +470,97 @@ void test18_sized_delete()
     check(true, "sized delete completed without crash");
 }
 
+// ─── TEST 20: deep call stack ────────────────────────────────────────────────
+// 20 noinline wrapper functions ensure a tall stack at the point of malloc.
+// With MEMTRACK_STACK_DEPTH=64 every frame is captured; we verify the #0 frame
+// points into test_app (not into memtrack.so) and the allocation is freed.
+
+__attribute__((noinline)) void* t20_leaf()     { return malloc(20020); }
+__attribute__((noinline)) void* t20_level_19() { return t20_leaf(); }
+__attribute__((noinline)) void* t20_level_18() { return t20_level_19(); }
+__attribute__((noinline)) void* t20_level_17() { return t20_level_18(); }
+__attribute__((noinline)) void* t20_level_16() { return t20_level_17(); }
+__attribute__((noinline)) void* t20_level_15() { return t20_level_16(); }
+__attribute__((noinline)) void* t20_level_14() { return t20_level_15(); }
+__attribute__((noinline)) void* t20_level_13() { return t20_level_14(); }
+__attribute__((noinline)) void* t20_level_12() { return t20_level_13(); }
+__attribute__((noinline)) void* t20_level_11() { return t20_level_12(); }
+__attribute__((noinline)) void* t20_level_10() { return t20_level_11(); }
+__attribute__((noinline)) void* t20_level_09() { return t20_level_10(); }
+__attribute__((noinline)) void* t20_level_08() { return t20_level_09(); }
+__attribute__((noinline)) void* t20_level_07() { return t20_level_08(); }
+__attribute__((noinline)) void* t20_level_06() { return t20_level_07(); }
+__attribute__((noinline)) void* t20_level_05() { return t20_level_06(); }
+__attribute__((noinline)) void* t20_level_04() { return t20_level_05(); }
+__attribute__((noinline)) void* t20_level_03() { return t20_level_04(); }
+__attribute__((noinline)) void* t20_level_02() { return t20_level_03(); }
+__attribute__((noinline)) void* t20_level_01() { return t20_level_02(); }
+
+__attribute__((noinline))
+void test20_deep_stack()
+{
+    hdr(20, "deep call stack — 20+ frames captured without corruption");
+    expect("malloc(20020) called 20 levels deep, freed, no LEAK");
+    log_marker("T20");
+
+    void* p = t20_level_01();
+    assert(p);
+    ((char*)p)[0] = 'T';
+    free(p);
+
+    check(true, "deep-stack alloc+free completed without crash");
+}
+
+// ─── TEST 21: long symbol names (heap buffer path in write_event) ─────────────
+// Deeply nested template types produce long mangled symbol names.  A recursive
+// Call-chain template instantiated 60 levels deep (each using the long L3 type
+// as its template parameter) produces ~60 frames of ~138 bytes each ≈ 8.3 KB,
+// exceeding the 8 KiB inline stack buffer and forcing write_event() to allocate
+// a heap buffer via real_malloc so no frame line is ever truncated.
+
+namespace t21_ns {
+
+template<typename A, typename B, typename C, typename D, typename E>
+struct LN {};
+
+using T  = int;
+using L1 = LN<T,  T,  T,  T,  T>;
+using L2 = LN<L1, L1, L1, L1, L1>;
+using L3 = LN<L2, L2, L2, L2, L2>;
+
+// Recursive call-chain: each level is a distinct template specialisation with
+// a long mangled name (embedding L3).  __attribute__((noinline)) on each
+// prevents any tail-call or inlining optimisation.
+template<typename X, int Depth>
+struct Chain {
+    __attribute__((noinline))
+    static void* alloc() { return Chain<X, Depth - 1>::alloc(); }
+};
+
+template<typename X>
+struct Chain<X, 0> {
+    __attribute__((noinline))
+    static void* alloc() { return malloc(21021); }
+};
+
+} // namespace t21_ns
+
+__attribute__((noinline))
+void test21_long_symbols()
+{
+    hdr(21, "long symbol names — heap buffer path in write_event");
+    // 60 template levels × ~138 bytes per frame ≈ 8.3 KB > 8 KiB inline buffer.
+    expect("malloc(21021) via 60-level template chain, freed, no LEAK");
+    log_marker("T21");
+
+    void* p = t21_ns::Chain<t21_ns::L3, 60>::alloc();
+    assert(p);
+    ((char*)p)[0] = 'T';
+    free(p);
+
+    check(true, "long-symbol alloc+free completed without crash");
+}
+
 // ─── TEST 19: failed realloc — old ptr still valid ───────────────────────────
 __attribute__((noinline))
 void test19_realloc_fail_safety()
@@ -525,6 +616,8 @@ int main()
     test17_multi_thread_clean();
     test18_sized_delete();
     test19_realloc_fail_safety();
+    test20_deep_stack();
+    test21_long_symbols();
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════\n");
