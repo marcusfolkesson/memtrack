@@ -921,17 +921,17 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
         int tw = max(1, cols_ - bar_x - span_lbl_w);  // sparkline cell count
 
         if (tw > 4 && any) {
-            // Find time range for the selected thread (or all)
+            // Always use GLOBAL time range so all thread views share the same x-axis.
+            // Only bar heights differ when a thread filter is active.
             uint64_t t_min = UINT64_MAX, t_max = 0;
             for (const auto& r : recs) {
-                if (tid_f != -1 && r.tid != tid_f) continue;
                 t_min = min(t_min, r.timestamp_us);
                 t_max = max(t_max, r.timestamp_us);
                 if (r.freed) t_max = max(t_max, r.free_timestamp_us);
             }
             uint64_t span = max<uint64_t>(1, t_max - t_min);
 
-            // Bucket: net live bytes per column cell
+            // Bucket: net live bytes per column cell (filtered by thread if active)
             vector<int64_t> net(tw, 0);
             for (const auto& r : recs) {
                 if (tid_f != -1 && r.tid != tid_f) continue;
