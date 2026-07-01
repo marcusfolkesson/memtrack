@@ -6,15 +6,22 @@ The library is partly made with Claude Sonnet 4.6.
 
 ## Features
 
-- Intercepts `malloc`, `calloc`, `realloc`, `free`, `operator new`, `operator delete` (including sized-delete C++14 overloads)
+- Intercepts `malloc`, `calloc`, `realloc`, `free`, `strdup`, `strndup`, `operator new`, `operator delete` (including sized-delete C++14 overloads)
 - Every allocation and free is logged with its **size**, **thread ID**, **thread name**, and **timestamp** (µs since program start)
 - Per-thread **running total** of bytes allocated
 - On thread exit: **cumulative total** and a **leak report** listing every pointer that was never freed
 - **Cross-thread free after exit** handled correctly — if thread B frees a pointer after the allocating thread has already exited and logged it as a leak, the free is logged and the leak entry is cancelled in memview
 - Optional **stack traces** per allocation/free with automatic C++ symbol demangling
+- Optional **per-thread stack trace filter** (`MEMTRACK_STACK_THREADS`) to capture frames only for threads of interest
 - Output to a **file** or stderr
 - **Minimum size filter** to ignore small allocations
-- Companion **ncurses TUI** (`memview`) for interactive browsing — including a **live follow mode** for monitoring running applications
+- Companion **ncurses TUI** (`memview`) for interactive browsing:
+  - Live follow mode for monitoring running applications
+  - **Group mode** — fold leaks by call site (count + total bytes)
+  - **Delta mode** (`m`) — snapshot a point in time and show only what was allocated after
+  - **Symbol search** (`/`) — filter by function name, thread, or pointer
+  - **Age filter** (`a`) — hide short-lived allocations below a time threshold
+  - **Jump to group** (`Enter`) — navigate between individual and grouped views instantly
 
 ## Build
 
@@ -208,10 +215,16 @@ Rows are sorted by `Net(live)` descending by default. The currently selected thr
 | `Tab` / `→` / `l` | Cycle focus forward: **list → detail → thread summary → list** |
 | `←` / `h` | Cycle focus backward |
 | `f` | Cycle filter: **All → Leaks → Active → Freed** |
+| `a` | Set minimum lifetime filter — prompts for seconds (`0` = off). Only allocations older than the threshold are shown. Active filter shown in header as `Age≥N`. |
+| `/` | Symbol search — prompts for a substring matched case-insensitively against stack frames, thread name, op, and pointer address. Empty input clears. Active search shown in header as `Search: foo`. |
+| `m` | Toggle **delta mode** — first press snapshots the current timestamp; only allocations that appear *after* the mark are shown. Header shows `▶ DELTA since T` in yellow. Press again to clear. |
+| `\` | Toggle **group mode** — folds all visible records with identical stack traces into one row showing count × total bytes + first frame. Press again or `Enter` to expand. |
+| `Enter` | In normal mode: jump to the group containing the selected record. In group mode: expand back to the individual record. |
 | `t` / `T` | Cycle thread filter forward / backward |
-| `s` | Cycle sort column (list pane: **Time → Size → Thread**; thread summary pane: **Name → TID → Allocated → Freed → Net(live) → Leaks**) |
+| `s` | Cycle sort column (list pane: **Time → Size → Thread**; group mode: **Total → Count**; thread summary pane: **Name → TID → Allocated → Freed → Net(live) → Leaks**) |
 | `S` | Reverse current sort direction |
 | `1` / `2` / `3` | Sort by Time / Size / Thread directly (press again to reverse) |
+| `L` | Toggle addr2line source-line resolution in the detail pane |
 | `F` | Toggle auto-follow in live mode (re-enabled by pressing `G`) |
 | `q` / `Esc` | Quit |
 
@@ -240,11 +253,36 @@ The pane respects the current **thread filter** (`t`/`T` keys): the filtered thr
 
 - For function names to appear in stack traces, compile with `-rdynamic`; inlined functions appear under the caller's name — use `__attribute__((noinline))` on allocating functions for accurate attribution.
 
+### Group mode (`\`)
+
+Press `\` to fold all visible records with identical stack traces into one row. Each row shows:
+
+- **×N** — number of allocations sharing this call site
+- **Total bytes** — combined size of all those allocations
+- **First frame** (demangled) + thread name
+
+Groups are sorted by total bytes descending by default (worst offenders first). Press `s` to switch to sort by count, `S` to reverse.
+
+Press **`Enter`** on a group to jump back to the individual records for that group. Press **`Enter`** on an individual record to jump to its group. Press `\` again to leave group mode.
+
+### Leak analysis workflow
+
+A typical session for finding memory leaks:
+
+1. Run the application under `LD_PRELOAD=./memtrack.so` with `MEMTRACK_OUTPUT=leak.log`
+2. Open `memview leak.log` (or use live mode with `-f` / TCP)
+3. Press **`f`** to switch to the **Leaks** filter
+4. Press **`\`** to enter **group mode** — identical call sites collapse into one row, sorted by total bytes leaked
+5. Navigate to the largest group and press **`Tab`** to see the full stack trace in the detail pane
+6. Use **`/`** to search for a specific function name if you already have a suspect
+7. Use **`a`** to set a minimum age (e.g. `5`) to hide transient allocations and keep only long-lived leaks
+8. In live mode, use **`m`** to mark a point in time — only allocations that appear after the mark are shown, making it easy to isolate what a specific operation leaks
+
 ---
 
 ## Test suite
 
-A comprehensive test application (`test_app`) exercises 19 different scenarios across multiple threads:
+A comprehensive test application (`test_app`) exercises 22 different scenarios across multiple threads:
 
 | Test | Scenario |
 |------|----------|
@@ -267,6 +305,10 @@ A comprehensive test application (`test_app`) exercises 19 different scenarios a
 | T17  | 4 worker threads each exercising all alloc types; all freed |
 | T18  | C++14 sized `::operator delete(ptr, n)` |
 | T19  | Failed `realloc` safety — original pointer remains valid and is freed |
+| T20  | 20-level deep call stack — stack capture and log integrity |
+| T21  | 60-level template recursion — long symbol names trigger heap buffer path in `write_event` |
+| T22  | `MEMTRACK_STACK_THREADS` filter — frames captured only for matching threads |
+| T23  | `strdup` / `strndup` — intercepted with their own op names, freed cleanly |
 
 Each test uses a unique size encoding (`T×1000+N`) so any allocation can be located by a simple `grep` in the log.
 
@@ -276,7 +318,7 @@ Run the suite and verify automatically:
 make test
 ```
 
-This builds `memtrack.so` and `test_app`, runs the app under `LD_PRELOAD`, captures the log to `mt.log`, and runs `verify.sh` which checks **40 assertions** and reports per-test PASS/FAIL.
+This builds `memtrack.so` and `test_app`, runs the app under `LD_PRELOAD`, captures the log to `mt.log`, and runs `verify.sh` which checks **51 assertions** and reports per-test PASS/FAIL.
 
 You can also run the verification manually:
 
