@@ -576,6 +576,32 @@ struct UI {
         if (group_mode) rebuild_groups();
     }
 
+    // Compute the grouping key for a single record (same logic as rebuild_groups).
+    static string group_key(const AllocRecord& r) {
+        if (!r.frames.empty()) {
+            string k;
+            for (const auto& f : r.frames) { k += f; k += '\n'; }
+            return k;
+        }
+        return "op:" + r.op;
+    }
+
+    // Switch to group mode and select the group that contains the given record.
+    void jump_to_group(const AllocRecord& r) {
+        group_mode = true;
+        rebuild_groups();   // re-sorts, may reorder
+        string key = group_key(r);
+        for (int i = 0; i < (int)groups.size(); i++) {
+            if (groups[i].key == key) {
+                selected   = i;
+                list_top   = max(0, i - 3); // a few rows of context above
+                detail_top = 0;
+                return;
+            }
+        }
+        selected = 0; list_top = 0; detail_top = 0;
+    }
+
     void rebuild_groups()
     {
         groups.clear();
@@ -832,7 +858,7 @@ static void draw_list(WINDOW* w, const UI& ui)
 
         // Counter
         wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
-        mvwprintw(w, rows - 1, 0, " %d / %d groups  [\\] ungroup",
+        mvwprintw(w, rows - 1, 0, " %d / %d groups  [Enter] expand  [\\] ungroup",
                   ui.groups.empty() ? 0 : ui.selected + 1,
                   (int)ui.groups.size());
         hline_to_eol(w, rows - 1, C_DIM);
@@ -901,7 +927,7 @@ static void draw_list(WINDOW* w, const UI& ui)
 
     // Counter
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
-    mvwprintw(w, rows - 1, 0, " %d / %d  [L]eak [A]ctive [F]reed  [\\] group",
+    mvwprintw(w, rows - 1, 0, " %d / %d  [L]eak [A]ctive [F]reed  [\\] group  [Enter] jump to group",
               ui.visible.empty() ? 0 : ui.selected + 1,
               (int)ui.visible.size());
     hline_to_eol(w, rows - 1, C_DIM);
@@ -1656,6 +1682,29 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.detail_top = 0;
                 // G = jump to bottom → re-enable auto-follow
                 if (live) ui.auto_follow = true;
+            } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                // Enter in normal mode: jump to the group containing this record.
+                // Enter in group mode: expand to normal view showing example record.
+                if (!ui.group_mode) {
+                    const AllocRecord* r = ui.current();
+                    if (r) ui.jump_to_group(*r);
+                } else {
+                    // Ungroup and land on the example record of the selected group
+                    size_t example = ui.groups.empty() ? 0
+                                   : ui.groups[min(ui.selected,(int)ui.groups.size()-1)].example_idx;
+                    ui.group_mode = false;
+                    ui.selected   = 0;
+                    ui.list_top   = 0;
+                    ui.detail_top = 0;
+                    // Find example in visible[]
+                    for (int i = 0; i < (int)ui.visible.size(); i++) {
+                        if (ui.visible[i] == example) {
+                            ui.selected = i;
+                            ui.list_top = max(0, i - 3);
+                            break;
+                        }
+                    }
+                }
             } else if (ch == 'f') {
                 ui.filter = (FilterMode)((ui.filter + 1) % F_COUNT);
                 ui.rebuild();
