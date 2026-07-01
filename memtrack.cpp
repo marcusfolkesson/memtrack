@@ -106,10 +106,54 @@ static std::atomic<int> g_outfd{STDERR_FILENO};
 static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socket)
 static size_t g_min_size       = 0;
 static int    g_stack_depth    = 0;       // 0 = stack traces disabled
+static size_t g_buffer_size    = 4096;    // per-thread write buffer (PIPE_BUF); 0 = unbuffered
+
+// Per-thread output buffer.  Used when g_buffer_size > 0.
+// Allocated lazily with real_malloc to avoid tracking the buffer itself.
+struct TLBuf {
+    char*  data = nullptr;
+    size_t len  = 0;
+
+    void init() {
+        if (data || !real_malloc) return;
+        data = static_cast<char*>(real_malloc(g_buffer_size));
+        // On allocation failure, data stays null — outfd_write falls back to
+        // direct writes.
+    }
+
+    void flush() {
+        if (!data || len == 0) return;
+        write(g_outfd.load(std::memory_order_relaxed), data, len);
+        len = 0;
+    }
+
+    // Append bytes to the buffer, flushing first if there is not enough room.
+    void append(const char* p, size_t n) {
+        if (!data) init();
+        if (!data) {
+            // Buffer allocation failed — fall back to a direct write.
+            write(g_outfd.load(std::memory_order_relaxed), p, n);
+            return;
+        }
+        if (len + n > g_buffer_size) flush();
+        if (n > g_buffer_size) {
+            // Single event larger than the whole buffer — write directly.
+            write(g_outfd.load(std::memory_order_relaxed), p, n);
+            return;
+        }
+        memcpy(data + len, p, n);
+        len += n;
+    }
+};
+static thread_local TLBuf tl_buf;
 
 static void outfd_write(const void* buf, size_t n)
 {
-    if (n > 0) write(g_outfd.load(std::memory_order_relaxed), buf, n);
+    if (n == 0) return;
+    if (g_buffer_size > 0)
+        tl_buf.append(static_cast<const char*>(buf), n);
+    else
+        write(g_outfd.load(std::memory_order_relaxed), buf, n);
 }
 
 // Monotonic start time – set in memtrack_ctor(); elapsed_us() returns
@@ -140,10 +184,15 @@ static void thread_exit_handler(void*)
     pid_t tid = (pid_t)syscall(SYS_gettid);
     char  buf[256];
 
+    // Flush any buffered events before emitting EXIT so the log is ordered.
+    tl_buf.flush();
+
     int n = snprintf(buf, sizeof(buf),
                      "[memtrack] tid=%-6d (%-15s) EXIT       ts=%-12llu total=%-12zu bytes allocated\n",
                      tid, get_thread_name(), (unsigned long long)elapsed_us(), thread_total);
     if (n > 0) outfd_write(buf, (size_t)n);
+    // EXIT itself is small enough to flush immediately in buffered mode too.
+    tl_buf.flush();
     // Leak detection is handled entirely by memview: it matches alloc/free
     // ptr fields in the log, using EXIT as the "thread is done" marker.
 }
@@ -160,6 +209,10 @@ static void thread_exit_handler(void*)
 
 static void atexit_handler()
 {
+    // Flush the main thread's buffer before closing — worker threads flushed
+    // in their own thread_exit_handler calls.
+    tl_buf.flush();
+
     // Signal EOF to the viewer.  For TCP sockets use shutdown(SHUT_WR) rather
     // than close() so that threads still running don't write to a recycled fd.
     if (g_close_outfd) {
@@ -258,6 +311,17 @@ static void __attribute__((constructor)) memtrack_ctor()
     if (depth) {
         long d = strtol(depth, nullptr, 10);
         g_stack_depth = (d > 0 && d <= 64) ? (int)d : 0;
+    }
+
+    const char* bufsz = getenv("MEMTRACK_BUFFER_SIZE");
+    if (bufsz) {
+        char* end = nullptr;
+        unsigned long long v = strtoull(bufsz, &end, 10);
+        if (end && *end) {
+            if (*end == 'k' || *end == 'K') v *= 1024ULL;
+            else if (*end == 'm' || *end == 'M') v *= 1024ULL * 1024ULL;
+        }
+        g_buffer_size = (size_t)v;
     }
 }
 

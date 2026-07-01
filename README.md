@@ -40,6 +40,7 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_OUTPUT`      | _(stderr)_    | Write all output to this file instead of stderr. Created/truncated at startup. |
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
 | `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. Symbols are emitted raw (mangled); `memview` demandles them on display. |
+| `MEMTRACK_BUFFER_SIZE` | `4096`        | Per-thread output buffer size. Accepts a plain byte count or a `K`/`M` suffix, e.g. `64K` or `1M`. Events are accumulated in a thread-local buffer and flushed in one `write()` call when the buffer is full, at thread exit, or at process exit. The default 4096 matches `PIPE_BUF` (guaranteed atomic on pipes) and reduces syscall overhead ~20% with minimal data-loss risk on crash. Set to `0` to disable buffering (one `write()` per event). |
 
 
 ### TCP server mode
