@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify.sh – parse a memtrack log produced by test_app and report PASS/FAIL
-# Works with BOTH compact mode (default: no size= in free lines, no LEAK/SUMMARY)
-# and full mode (MEMTRACK_COMPACT=0: size= in free lines, LEAK/SUMMARY lines).
+# Free lines have no size= field; alloc/free matching is done by ptr with
+# line-number awareness to handle address reuse correctly.
 # Usage:  ./verify.sh mt.log
 #         LD_PRELOAD=./memtrack.so ./test_app 2>mt.log && ./verify.sh mt.log
 
@@ -18,16 +18,9 @@ PASS=0; FAIL=0
 pass() { printf "  \033[32m✓\033[0m  %s\n" "$1"; ((PASS++)); }
 fail() { printf "  \033[31m✗\033[0m  %s\n" "$1"; ((FAIL++)); }
 
-# Detect compact vs full mode: full mode has size= in free lines.
-COMPACT=1
-if grep -qE '^\[memtrack\].*\b(free|delete|delete\[\])\s.*size=[0-9]' "$LOG" 2>/dev/null; then
-    COMPACT=0
-fi
-
 # Return ptrs (one per line) for all alloc lines of a given size.
 alloc_ptrs() {
-    local sz="$1"
-    grep -E " (malloc|calloc|realloc|new|new\[\]) +.*size=${sz} " "$LOG" \
+    grep -E " (malloc|calloc|realloc|new|new\[\]) +.*size=${1} " "$LOG" \
         | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//'
 }
 
@@ -50,7 +43,7 @@ first_alloc_ptr() { alloc_ptrs "$1" | head -1; }
 first_alloc_entry() { alloc_entries "$1" | head -1; }
 
 # True if ptr appears in a free/delete line AFTER a given log line number.
-# This handles address reuse: the same ptr may be freed and reallocated many times.
+# Handles address reuse: the same ptr may be freed and reallocated many times.
 ptr_freed_after() {
     local ptr="$1" after="$2"
     grep -nE " (free|delete(\[\])?) +.*\bptr=${ptr}$" "$LOG" \
@@ -64,12 +57,10 @@ ptr_free_lineno_after() {
         | awk -F: -v a="$after" '$1 > a {print $1; exit}'
 }
 
-# Backward-compat: true if ptr appears in any free line (ignores reuse — avoid where possible).
+# True if ptr appears in any free line (for quick leak checks where reuse is not a concern).
 ptr_is_freed() {
-    local ptr="$1"
-    grep -qE " (free|delete(\[\])?) +.*\bptr=${ptr}$" "$LOG"
+    grep -qE " (free|delete(\[\])?) +.*\bptr=${1}$" "$LOG"
 }
-ptr_not_freed() { ! ptr_is_freed "$1"; }
 
 # Count alloc lines with given size.
 alloc_count() {
@@ -77,8 +68,7 @@ alloc_count() {
 }
 
 # ── Check that every alloc of a given size has a matching free ────────────────
-# In compact mode: match by ptr with line-number awareness to handle address reuse.
-# In full mode: count by size in both alloc and free lines.
+# Match by ptr with line-number awareness to handle address reuse.
 check_alloc_free() {
     local sz="$1" label="$2"
     local allocs
@@ -87,24 +77,14 @@ check_alloc_free() {
         fail "$label: size=$sz — not found in log"
         return
     fi
-    if [[ "$COMPACT" -eq 0 ]]; then
-        local frees
-        frees=$(grep -cE " (free|delete|delete\[\]) +.*size=${sz} " "$LOG" 2>/dev/null || true)
-        if [[ "$frees" -ge "$allocs" ]]; then
-            pass "$label: size=$sz allocated ($allocs) and freed ($frees)"
-        else
-            fail "$label: size=$sz — $allocs allocs but only $frees frees (possible leak)"
-        fi
+    local freed=0
+    while IFS=' ' read -r lineno ptr; do
+        ptr_freed_after "$ptr" "$lineno" && ((freed++)) || true
+    done < <(alloc_entries "$sz")
+    if [[ "$freed" -ge "$allocs" ]]; then
+        pass "$label: size=$sz allocated ($allocs) and freed ($freed)"
     else
-        local freed=0
-        while IFS=' ' read -r lineno ptr; do
-            ptr_freed_after "$ptr" "$lineno" && ((freed++)) || true
-        done < <(alloc_entries "$sz")
-        if [[ "$freed" -ge "$allocs" ]]; then
-            pass "$label: size=$sz allocated ($allocs) and freed ($freed)"
-        else
-            fail "$label: size=$sz — $allocs allocs but only $freed freed (possible leak)"
-        fi
+        fail "$label: size=$sz — $allocs allocs but only $freed freed (possible leak)"
     fi
 }
 
@@ -159,7 +139,7 @@ check_free_op() {
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"
-echo "  memtrack verify: $LOG ($([ "$COMPACT" -eq 1 ] && echo compact || echo full) mode)"
+echo "  memtrack verify: $LOG"
 echo "══════════════════════════════════════════════════════════════"
 
 # ── TEST 01: malloc/free ────────────────────────────────────────────────────
@@ -194,7 +174,6 @@ echo ""; echo "TEST 06: realloc grow"
 check_alloc_free 6006  "T06: original malloc"
 check_alloc_free 12012 "T06: grown realloc"
 # The free of 6006 should precede the realloc(12012) in the log.
-# In compact mode: free of the 6006 ptr should appear before the realloc(12012) alloc line.
 ptr6006=$(first_alloc_ptr 6006)
 lno6006=$(first_alloc_entry 6006 | cut -d' ' -f1)
 if [[ -n "$ptr6006" && -n "$lno6006" ]]; then
@@ -222,27 +201,22 @@ check_alloc_free 8008 "T08: malloc then realloc(ptr,0)"
 echo ""; echo "TEST 09: realloc chain"
 check_alloc_free 9009 "T09: final realloc size"
 # Verify each intermediate alloc has a corresponding free.
+# Verify each intermediate alloc has a corresponding free.
 for sz in 200 400 800 9009; do
     a=$(grep -cE " (malloc|realloc) +.*size=${sz} " "$LOG" 2>/dev/null || true)
-    if [[ "$COMPACT" -eq 0 ]]; then
-        f=$(grep -cE " (free|realloc) +.*size=${sz} " "$LOG" 2>/dev/null || true)
-        [[ "$a" -ge 1 && "$f" -ge 1 ]] && pass "T09: chain step size=$sz present and freed" \
-                                        || fail "T09: chain step size=$sz missing (allocs=$a frees=$f)"
-    else
-        freed=0; found=0
-        while IFS=' ' read -r lineno ptr; do
-            ((found++))
-            ptr_freed_after "$ptr" "$lineno" && ((freed++)) || true
-        done < <(grep -nE " (malloc|realloc) +.*size=${sz} " "$LOG" \
-                   | while IFS= read -r line; do
-                       lno=$(echo "$line" | cut -d: -f1)
-                       p=$(echo "$line" | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//')
-                       echo "$lno $p"
-                   done)
-        [[ "$found" -ge 1 && "$freed" -ge "$found" ]] \
-            && pass "T09: chain step size=$sz present and freed" \
-            || fail "T09: chain step size=$sz: found=$found freed=$freed"
-    fi
+    freed=0; found=0
+    while IFS=' ' read -r lineno ptr; do
+        ((found++))
+        ptr_freed_after "$ptr" "$lineno" && ((freed++)) || true
+    done < <(grep -nE " (malloc|realloc) +.*size=${sz} " "$LOG" \
+               | while IFS= read -r line; do
+                   lno=$(echo "$line" | cut -d: -f1)
+                   p=$(echo "$line" | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//')
+                   echo "$lno $p"
+               done)
+    [[ "$found" -ge 1 && "$freed" -ge "$found" ]] \
+        && pass "T09: chain step size=$sz present and freed" \
+        || fail "T09: chain step size=$sz: found=$found freed=$freed"
 done
 
 # ── TEST 10: free(NULL) silent ────────────────────────────────────────────────
@@ -272,28 +246,19 @@ check_alloc_free 10485760 "T12: 10 MB alloc+free"
 # ── TEST 13: many small allocs ───────────────────────────────────────────────
 echo ""; echo "TEST 13: many small allocs"
 m13=$(grep -cE " malloc +.*size=13 " "$LOG" 2>/dev/null || true)
-if [[ "$COMPACT" -eq 0 ]]; then
-    f13=$(grep -cE " free +.*size=13 " "$LOG" 2>/dev/null || true)
-    if [[ "$m13" -ge 200 && "$f13" -ge 200 ]]; then
-        pass "T13: 200 malloc(13) and 200 free(13) found"
-    else
-        fail "T13: expected ≥200 of each, got malloc=$m13 free=$f13"
-    fi
+freed13=0
+while IFS=' ' read -r lineno ptr; do
+    ptr_freed_after "$ptr" "$lineno" && ((freed13++)) || true
+done < <(grep -nE " malloc +.*size=13 " "$LOG" \
+           | while IFS= read -r line; do
+               lno=$(echo "$line" | cut -d: -f1)
+               p=$(echo "$line" | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//')
+               echo "$lno $p"
+           done)
+if [[ "$m13" -ge 200 && "$freed13" -ge 200 ]]; then
+    pass "T13: 200 malloc(13) allocated ($m13) and freed ($freed13)"
 else
-    freed13=0
-    while IFS=' ' read -r lineno ptr; do
-        ptr_freed_after "$ptr" "$lineno" && ((freed13++)) || true
-    done < <(grep -nE " malloc +.*size=13 " "$LOG" \
-               | while IFS= read -r line; do
-                   lno=$(echo "$line" | cut -d: -f1)
-                   p=$(echo "$line" | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//')
-                   echo "$lno $p"
-               done)
-    if [[ "$m13" -ge 200 && "$freed13" -ge 200 ]]; then
-        pass "T13: 200 malloc(13) allocated ($m13) and freed ($freed13)"
-    else
-        fail "T13: expected ≥200 of each, got malloc=$m13 freed=$freed13"
-    fi
+    fail "T13: expected ≥200 of each, got malloc=$m13 freed=$freed13"
 fi
 
 # ── TEST 14: intentional leak ─────────────────────────────────────────────────
@@ -307,10 +272,6 @@ elif ! ptr_freed_after "$ptr14" "$lno14"; then
     pass "T14: malloc(14014) at $ptr14 — correctly NOT freed (leak)"
 else
     fail "T14: malloc(14014) was freed after alloc — expected intentional leak"
-fi
-# In full mode there is also a LEAK line; check it if so.
-if [[ "$COMPACT" -eq 0 ]]; then
-    check_present "LEAK.*size=14014" "T14: LEAK(14014) in full-mode log"
 fi
 
 # ── TEST 15: cross-thread free ────────────────────────────────────────────────
@@ -339,10 +300,6 @@ if [[ -n "$ptr15" ]]; then
 else
     fail "T15: malloc(15015) not found in log"
 fi
-# In full mode, SUMMARY line confirms no leak.
-if [[ "$COMPACT" -eq 0 ]]; then
-    check_absent "t15-alloc.*SUMMARY.*unfreed" "T15: t15-alloc SUMMARY shows no unfreed"
-fi
 
 # ── TEST 16: LEAK cancellation ───────────────────────────────────────────────
 echo ""; echo "TEST 16: LEAK cancellation"
@@ -367,49 +324,32 @@ else
     else
         fail "T16: ptr16016 was NOT freed — expected cancellation"
     fi
-    # In full mode, verify LEAK line exists before the free.
-    if [[ "$COMPACT" -eq 0 ]]; then
-        leak_line=$(grep -n "LEAK.*size=16016" "$LOG" | head -1 | cut -d: -f1)
-        if [[ -n "$leak_line" && -n "$free_line" && "$free_line" -gt "$leak_line" ]]; then
-            pass "T16: full mode — LEAK(16016) then free(16016)"
-        else
-            fail "T16: full mode — LEAK/free ordering wrong"
-        fi
-    fi
 fi
 
 # ── TEST 17: multi-thread clean ───────────────────────────────────────────────
 echo ""; echo "TEST 17: multi-thread clean"
 for w in 1 2 3 4; do
-    if [[ "$COMPACT" -eq 0 ]]; then
-        if grep -q "t17-w${w}.*SUMMARY.*all allocations freed" "$LOG"; then
-            pass "T17: t17-w${w} SUMMARY: all allocations freed"
+    # Verify EXIT emitted and all ptrs by this thread name are freed.
+    if grep -qE "\(t17-w${w}\s*\) EXIT " "$LOG"; then
+        leaked=0 total=0
+        while IFS=' ' read -r lineno ptr; do
+            ((total++))
+            ptr_freed_after "$ptr" "$lineno" || ((leaked++)) || true
+        done < <(grep -nE "\(t17-w${w}\s*\) (malloc|calloc|new|new\[\]|realloc) " "$LOG" \
+                   | while IFS= read -r line; do
+                       lno=$(echo "$line" | cut -d: -f1)
+                       p=$(echo "$line" | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//')
+                       echo "$lno $p"
+                   done)
+        if [[ "$leaked" -eq 0 && "$total" -gt 0 ]]; then
+            pass "T17: t17-w${w} — all $total allocations freed"
+        elif [[ "$total" -eq 0 ]]; then
+            fail "T17: t17-w${w} — no allocations found in log"
         else
-            fail "T17: t17-w${w} SUMMARY did not say 'all allocations freed'"
+            fail "T17: t17-w${w} — $leaked/$total allocations NOT freed"
         fi
     else
-        # Compact mode: verify EXIT emitted and all ptrs by this thread name are freed.
-        if grep -qE "\(t17-w${w}\s*\) EXIT " "$LOG"; then
-            leaked=0 total=0
-            while IFS=' ' read -r lineno ptr; do
-                ((total++))
-                ptr_freed_after "$ptr" "$lineno" || ((leaked++)) || true
-            done < <(grep -nE "\(t17-w${w}\s*\) (malloc|calloc|new|new\[\]|realloc) " "$LOG" \
-                       | while IFS= read -r line; do
-                           lno=$(echo "$line" | cut -d: -f1)
-                           p=$(echo "$line" | grep -oE 'ptr=0x[0-9a-f]+' | sed 's/ptr=//')
-                           echo "$lno $p"
-                       done)
-            if [[ "$leaked" -eq 0 && "$total" -gt 0 ]]; then
-                pass "T17: t17-w${w} — all $total allocations freed"
-            elif [[ "$total" -eq 0 ]]; then
-                fail "T17: t17-w${w} — no allocations found in log"
-            else
-                fail "T17: t17-w${w} — $leaked/$total allocations NOT freed"
-            fi
-        else
-            fail "T17: t17-w${w} — EXIT line not found"
-        fi
+        fail "T17: t17-w${w} — EXIT line not found"
     fi
 done
 

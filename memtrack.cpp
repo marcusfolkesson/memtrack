@@ -26,9 +26,6 @@
 #include <stdint.h>
 #include <time.h>
 #include <new>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 #include <atomic>
 #include <cstdlib>
 
@@ -110,10 +107,8 @@ static void log_free(void*, const char*); // forward declaration
 static std::atomic<int> g_outfd{STDERR_FILENO};
 static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socket)
 static size_t g_min_size       = 0;
-static int    g_stack_depth    = 0;   // 0 = stack traces disabled
-static bool   g_demangle       = false; // demangle in memtrack (default off — let memview do it)
-static bool   g_compact        = true;  // MEMTRACK_COMPACT (default on): use CompactAllocInfo
-                                         // instead of AllocInfo to save ~11× map memory
+static int    g_stack_depth    = 0;       // 0 = stack traces disabled
+static bool   g_demangle       = false;   // demangle in memtrack (default off — let memview do it)
 
 static void outfd_write(const void* buf, size_t n)
 {
@@ -139,123 +134,7 @@ static uint64_t elapsed_us()
 }
 
 // ---------------------------------------------------------------------------
-// Global allocation map  (ptr -> {tid, size, op})
-//
-// Tracks every live user allocation so we can report un-freed ones at exit.
-// The map's own internal nodes are allocated while in_hook==true and are
-// therefore never inserted into the map themselves.
-// ---------------------------------------------------------------------------
-
-// Full allocation record — used when MEMTRACK_COMPACT=0.
-// Stores everything needed to reprint stack frames at thread exit.
-struct AllocInfo {
-    pid_t    tid;
-    char     name[16];
-    size_t   size;
-    char     op[12];
-    uint64_t timestamp_us;
-    int      frame_count;
-    void*    frames[32];    // ~308 bytes total
-};
-
-// Compact allocation record — used when MEMTRACK_COMPACT=1 (the default).
-// Only keeps what is needed to log the free size and the exit LEAK line.
-// memview reconstructs op/ts/frames from the original alloc log line.
-struct CompactAllocInfo {
-    pid_t  tid;
-    char   name[16];
-    size_t size;            // ~28 bytes total — ~11× smaller than AllocInfo
-};
-
-// ---------------------------------------------------------------------------
-// Sharded allocation map
-//
-// 16 shards keyed by (uintptr_t(ptr) >> 4) & 15.  Each shard has its own
-// mutex, reducing lock contention by ~16× compared to a single global lock.
-// Cross-thread frees are transparent: alloc and free for the same pointer
-// always hash to the same shard.
-// g_reported_leaks lives inside each shard alongside the allocation map so
-// the two structures are always protected by the same lock.
-// ---------------------------------------------------------------------------
-static constexpr int NSHARDS = 16;
-
-struct alignas(64) MapShard {
-    pthread_mutex_t                              lock;
-    std::unordered_map<void*, AllocInfo>*        map            = nullptr;
-    std::unordered_map<void*, CompactAllocInfo>* cmap           = nullptr;
-    std::unordered_map<void*, size_t>*           reported_leaks = nullptr;
-};
-
-static MapShard g_shards[NSHARDS];
-
-static void shards_init()
-{
-    for (auto& sh : g_shards)
-        pthread_mutex_init(&sh.lock, nullptr);
-}
-
-static inline int shard_of(void* ptr)
-{
-    return (int)(((uintptr_t)ptr >> 4) & (NSHARDS - 1));
-}
-
-// Record a user allocation.  Caller must have set in_hook = true first.
-// In compact mode this is a no-op: the alloc is logged to the file and
-// memview tracks it there; no in-process map entry is needed.
-static void map_record(void* ptr, size_t size, const char* op,
-                       void** frames, int frame_count, uint64_t ts)
-{
-    if (g_compact) return;  // memview reconstructs everything from the log
-    if (!ptr || is_bootstrap_ptr(ptr)) return;
-    int s = shard_of(ptr);
-    MapShard& sh = g_shards[s];
-    pthread_mutex_lock(&sh.lock);
-    if (g_compact) {
-        if (!sh.cmap) {
-            try { sh.cmap = new std::unordered_map<void*, CompactAllocInfo>(); }
-            catch (...) { pthread_mutex_unlock(&sh.lock); return; }
-        }
-        CompactAllocInfo info;
-        info.tid  = (pid_t)syscall(SYS_gettid);
-        memcpy(info.name, get_thread_name(), sizeof(info.name));
-        info.size = size;
-        try { (*sh.cmap)[ptr] = info; } catch (...) {}
-    } else {
-        if (!sh.map) {
-            try { sh.map = new std::unordered_map<void*, AllocInfo>(); }
-            catch (...) { pthread_mutex_unlock(&sh.lock); return; }
-        }
-        AllocInfo info;
-        info.tid          = (pid_t)syscall(SYS_gettid);
-        memcpy(info.name, get_thread_name(), sizeof(info.name));
-        info.size         = size;
-        info.timestamp_us = ts;
-        strncpy(info.op, op, sizeof(info.op) - 1);
-        info.op[sizeof(info.op) - 1] = '\0';
-        info.frame_count = frame_count;
-        for (int i = 0; i < frame_count; i++) info.frames[i] = frames[i];
-        try { (*sh.map)[ptr] = info; } catch (...) {}
-    }
-    pthread_mutex_unlock(&sh.lock);
-}
-
-// Remove a freed pointer.  Only acts when in_hook is false (i.e. this is a
-// genuine user free, not the map deallocating its own internal nodes).
-static void map_remove(void* ptr)
-{
-    if (g_compact) return;
-    if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
-    in_hook = true;
-    int s = shard_of(ptr);
-    MapShard& sh = g_shards[s];
-    pthread_mutex_lock(&sh.lock);
-    if (sh.map) sh.map->erase(ptr);
-    pthread_mutex_unlock(&sh.lock);
-    in_hook = false;
-}
-
-// ---------------------------------------------------------------------------
-// Thread-exit handler – prints total and any unfreed allocations
+// Thread-exit handler – logs EXIT so memview can detect leaked allocations
 // ---------------------------------------------------------------------------
 static pthread_key_t exit_key;
 
@@ -263,190 +142,30 @@ static void thread_exit_handler(void*)
 {
     pid_t tid = (pid_t)syscall(SYS_gettid);
     char  buf[256];
-    int   n;
 
-    n = snprintf(buf, sizeof(buf),
-                 "[memtrack] tid=%-6d (%-15s) EXIT       ts=%-12llu total=%-12zu bytes allocated\n",
-                 tid, get_thread_name(), (unsigned long long)elapsed_us(), thread_total);
+    int n = snprintf(buf, sizeof(buf),
+                     "[memtrack] tid=%-6d (%-15s) EXIT       ts=%-12llu total=%-12zu bytes allocated\n",
+                     tid, get_thread_name(), (unsigned long long)elapsed_us(), thread_total);
     if (n > 0) outfd_write(buf, (size_t)n);
-
-    if (g_compact) {
-        // In compact mode memview detects leaks from the log directly.
-        // No map, no LEAK/SUMMARY lines needed from memtrack.
-        return;
-    }
-
-    in_hook = true;
-
-    size_t leak_count = 0;
-    size_t leak_bytes = 0;
-
-    // Full mode: iterate map, emit LEAK lines with ts/op and reprint frames.
-    struct LeakEntry { void* ptr; AllocInfo info; };
-    std::vector<LeakEntry> leaks;
-    for (int s = 0; s < NSHARDS; s++) {
-        MapShard& sh = g_shards[s];
-        pthread_mutex_lock(&sh.lock);
-        if (sh.map) {
-            leaks.clear();
-            for (auto& [ptr, info] : *sh.map) {
-                if (info.tid != tid) continue;
-                ++leak_count;
-                leak_bytes += info.size;
-                leaks.push_back({ptr, info});
-                if (!sh.reported_leaks) {
-                    try { sh.reported_leaks = new std::unordered_map<void*, size_t>(); }
-                    catch (...) {}
-                }
-                if (sh.reported_leaks) {
-                    try { (*sh.reported_leaks)[ptr] = info.size; } catch (...) {}
-                }
-            }
-            for (auto it = sh.map->begin(); it != sh.map->end(); )
-                it = (it->second.tid == tid) ? sh.map->erase(it) : ++it;
-        }
-        pthread_mutex_unlock(&sh.lock);
-        for (auto& e : leaks) {
-            n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
-                         tid, get_thread_name(), (unsigned long long)e.info.timestamp_us,
-                         e.info.op, e.info.size, e.ptr);
-            if (n > 0) outfd_write(buf, (size_t)n);
-            if (e.info.frame_count > 0)
-                print_frames(e.info.frames, e.info.frame_count);
-        }
-    }
-
-    if (leak_count > 0) {
-        n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
-                     tid, get_thread_name(), leak_count, leak_bytes);
-    } else {
-        n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) SUMMARY    all allocations freed\n",
-                     tid, get_thread_name());
-    }
-    if (n > 0) outfd_write(buf, (size_t)n);
-
-    in_hook = false;
+    // Leak detection is handled entirely by memview: it matches alloc/free
+    // ptr fields in the log, using EXIT as the "thread is done" marker.
 }
 
 // ---------------------------------------------------------------------------
-// atexit handler – catches any allocations missed by thread_exit_handler
+// atexit handler – signals EOF to the viewer once the process finishes
 // ---------------------------------------------------------------------------
 //
-// pthread_key destructors fire when a *thread* exits.  When the *process*
-// exits via exit() or main() returning, glibc does not reliably call the
-// pthread_key destructor for the main thread.  As a result, any allocations
-// made by the main thread (or by threads still running at process exit) would
-// remain as "Active" in the viewer even though the application has finished.
-// This atexit handler sweeps whatever is still in g_map and reports it as
-// LEAK/SUMMARY, grouped by tid, so the viewer always shows a complete picture.
+// pthread_key destructors fire when a *thread* exits, but glibc does not
+// reliably call them for the main thread when the process exits via exit()
+// or main() returning.  This atexit handler closes the output fd, which
+// signals EOF to a connected memview instance so it can finalize leak
+// detection from the log.
 
 static void atexit_handler()
 {
-    in_hook = true;
-
-    if (g_compact) {
-        // Compact mode: memview reconstructs all leaks from the log.
-        // Nothing to scan; just signal EOF to the viewer.
-        in_hook = false;
-        goto signal_eof;
-    }
-
-    // Full mode: scan all shards for any threads that didn't call
-    // thread_exit_handler (e.g. main thread, or threads still alive at exit).
-
-    {
-        // First pass over all shards: collect unique TIDs still alive.
-        pid_t seen[1024];
-        int   seen_count = 0;
-        for (int s = 0; s < NSHARDS; s++) {
-            pthread_mutex_lock(&g_shards[s].lock);
-            if (g_shards[s].map)
-                for (auto& [ptr, info] : *g_shards[s].map) {
-                    bool found = false;
-                    for (int i = 0; i < seen_count; i++)
-                        if (seen[i] == info.tid) { found = true; break; }
-                    if (!found && seen_count < (int)(sizeof(seen)/sizeof(seen[0])))
-                        seen[seen_count++] = info.tid;
-                }
-            pthread_mutex_unlock(&g_shards[s].lock);
-        }
-
-        if (seen_count == 0) {
-            in_hook = false;
-            goto signal_eof;
-        }
-
-        char buf[256];
-        int  n;
-
-        for (int si = 0; si < seen_count; si++) {
-            pid_t  tid        = seen[si];
-            size_t leak_count = 0;
-            size_t leak_bytes = 0;
-            char   tname[16]  = {};
-
-            struct LeakEntry { void* ptr; AllocInfo info; };
-            std::vector<LeakEntry> leaks;
-            for (int s = 0; s < NSHARDS; s++) {
-                MapShard& sh = g_shards[s];
-                pthread_mutex_lock(&sh.lock);
-                if (sh.map) {
-                    leaks.clear();
-                    for (auto& [ptr, info] : *sh.map) {
-                        if (info.tid != tid) continue;
-                        if (!tname[0]) memcpy(tname, info.name, sizeof(tname));
-                        ++leak_count;
-                        leak_bytes += info.size;
-                        leaks.push_back({ptr, info});
-                        if (!sh.reported_leaks) {
-                            try { sh.reported_leaks = new std::unordered_map<void*, size_t>(); }
-                            catch (...) {}
-                        }
-                        if (sh.reported_leaks) {
-                            try { (*sh.reported_leaks)[ptr] = info.size; } catch (...) {}
-                        }
-                    }
-                    for (auto it = sh.map->begin(); it != sh.map->end(); )
-                        it = (it->second.tid == tid) ? sh.map->erase(it) : ++it;
-                }
-                pthread_mutex_unlock(&sh.lock);
-                for (auto& e : leaks) {
-                    n = snprintf(buf, sizeof(buf),
-                                 "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
-                                 tid, e.info.name,
-                                 (unsigned long long)e.info.timestamp_us,
-                                 e.info.op, e.info.size, e.ptr);
-                    if (n > 0) outfd_write(buf, (size_t)n);
-                    if (e.info.frame_count > 0)
-                        print_frames(e.info.frames, e.info.frame_count);
-                }
-            }
-
-            if (leak_count > 0) {
-                n = snprintf(buf, sizeof(buf),
-                             "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
-                             tid, tname[0] ? tname : "?", leak_count, leak_bytes);
-                if (n > 0) outfd_write(buf, (size_t)n);
-            }
-        }
-    }
-
-    in_hook = false;
-
-signal_eof:
     // Signal EOF to the viewer.  For TCP sockets use shutdown(SHUT_WR) rather
     // than close() so that threads still running don't write to a recycled fd.
-    // For plain files close() is safe here since we're in the atexit handler
-    // and the process is single-threaded at this point in practice.
     if (g_close_outfd) {
-        // Atomically redirect writers to stderr before closing the fd.
-        // Any write() that loaded the old fd *before* this swap will go to a
-        // closed (or recycled) fd — that's an unavoidable TOCTOU given that
-        // we can't quiesce all threads here.  Writers that load *after* the swap
-        // go safely to stderr.
         int old_fd = g_outfd.exchange(STDERR_FILENO, std::memory_order_acq_rel);
         if (old_fd != STDERR_FILENO) {
             int type = 0; socklen_t tlen = sizeof(type);
@@ -460,7 +179,6 @@ signal_eof:
 
 static void __attribute__((constructor)) memtrack_ctor()
 {
-    shards_init();
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
     if (pthread_key_create(&exit_key, thread_exit_handler) != 0) {
         const char msg[] = "[memtrack] WARNING: pthread_key_create failed; thread-exit leak reports disabled\n";
@@ -547,9 +265,6 @@ static void __attribute__((constructor)) memtrack_ctor()
 
     const char* dem = getenv("MEMTRACK_DEMANGLE");
     if (dem) g_demangle = (dem[0] != '0' && dem[0] != '\0');
-
-    const char* compact_env = getenv("MEMTRACK_COMPACT");
-    if (compact_env) g_compact = (compact_env[0] != '0' && compact_env[0] != '\0');
 }
 
 static inline void ensure_exit_hook()
@@ -579,7 +294,7 @@ static const char* get_thread_name()
 
 // Print symbolised stack frames.  Must be called with in_hook == true.
 // backtrace_symbols() allocates internally; real_free() is used to release it
-// so the freed buffer (which was never tracked) doesn't confuse map_remove.
+// so the freed buffer is never tracked.
 //
 // Each symbol string from backtrace_symbols looks like one of:
 //   ./binary(mangled_name+0xNN) [0xADDR]   — Linux with -rdynamic
@@ -672,8 +387,6 @@ static void log_alloc(const char* op, size_t size, void* ptr)
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    map_record(ptr, size, op, frames, frame_count, ts);
-
     char buf[384];
     int n = snprintf(buf, sizeof(buf),
                      "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  total=%-12zu  ptr=%p\n",
@@ -687,10 +400,8 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 }
 
 // Log a free/delete event and capture the stack frames.
-// On return, in_hook is TRUE if the pointer was tracked; the caller is then
-// responsible for: erasing from g_map, calling real_free, clearing in_hook,
-// and finally calling print_frames.
-// Returns true if tracked (caller must handle the cleanup), false otherwise.
+// On return, in_hook is TRUE and the caller must: call real_free, clear
+// in_hook, and optionally call print_frames if frame_count > 0.
 static bool log_free_capture(void* ptr, const char* op,
                               void** frames, int& frame_count)
 {
@@ -701,19 +412,6 @@ static bool log_free_capture(void* ptr, const char* op,
 
     uint64_t ts = elapsed_us();
 
-    if (g_compact) {
-        // No map: log the free without size (memview gets size from alloc record).
-        // Always considered tracked — memview silently ignores frees for
-        // pointers it didn't see allocated (e.g. pre-load allocations).
-        char buf[256];
-        int n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu  ptr=%p\n",
-                         get_tid(), get_thread_name(), op, (unsigned long long)ts, ptr);
-        if (n > 0) outfd_write(buf, (size_t)n);
-        return true;
-    }
-
-    // Full mode: capture frames then look up the map for size.
     if (g_stack_depth > 0) {
         const int skip  = 2;
         const int total = g_stack_depth + skip;
@@ -722,52 +420,22 @@ static bool log_free_capture(void* ptr, const char* op,
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    size_t size    = 0;
-    bool   tracked = false;
-    int    s       = shard_of(ptr);
-    MapShard& sh   = g_shards[s];
-    pthread_mutex_lock(&sh.lock);
-    if (sh.map) {
-        auto it = sh.map->find(ptr);
-        if (it != sh.map->end()) { size = it->second.size; tracked = true; }
-    }
-    // Cross-thread free after exit handler: ptr was removed from the shard map
-    // but recorded in reported_leaks so we can log a cancelling free entry.
-    if (!tracked && sh.reported_leaks) {
-        auto it2 = sh.reported_leaks->find(ptr);
-        if (it2 != sh.reported_leaks->end()) {
-            size    = it2->second;
-            tracked = true;
-            sh.reported_leaks->erase(it2);
-        }
-    }
-    pthread_mutex_unlock(&sh.lock);
-
-    if (!tracked) {
-        in_hook = false;
-        return false;
-    }
-
-    char buf[384];
+    char buf[256];
     int n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  ptr=%p\n",
-                     get_tid(), get_thread_name(), op,
-                     (unsigned long long)ts, size, ptr);
+                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op, (unsigned long long)ts, ptr);
     if (n > 0) outfd_write(buf, (size_t)n);
 
     return true;
 }
 
-// log_free: full log+print in one call.  Used by the realloc hook which
-// logs a synthetic free of old_ptr without calling real_free itself.
+// log_free: convenience wrapper for realloc (logs a synthetic free without
+// calling real_free — realloc does that itself via real_realloc).
 static void log_free(void* ptr, const char* op)
 {
     void* frames[32];
     int   frame_count = 0;
     if (!log_free_capture(ptr, op, frames, frame_count)) return;
-    // in_hook is true here; realloc owns the actual freeing, so just clear
-    // and print.  The window is small because real_realloc is called
-    // immediately after under its own in_hook=true block.
     in_hook = false;
     if (frame_count > 0) print_frames(frames, frame_count);
 }
@@ -828,26 +496,16 @@ void* realloc(void* old_ptr, size_t size)
     // for consistent, predictable behaviour.
     if (size == 0) {
         log_free(old_ptr, "free");
-        map_remove(old_ptr);
         real_realloc(old_ptr, 0);
         return nullptr;
     }
 
-    // Log the implicit free of old_ptr before we erase it from the map.
+    // Log the implicit free of old_ptr before calling real_realloc.
     // This ensures the log has a matching free entry even when real_realloc
-    // returns the same address (in-place growth), preventing memview from
-    // treating the old record as a phantom leak.
+    // returns the same address (in-place growth).
     log_free(old_ptr, "free");
 
-    // Hold in_hook while we erase old_ptr and call real_realloc so no other
-    // thread can slip in between and re-use the same address in our map.
     in_hook = true;
-    if (!g_compact) {
-        int s = shard_of(old_ptr);
-        pthread_mutex_lock(&g_shards[s].lock);
-        if (g_shards[s].map) g_shards[s].map->erase(old_ptr);
-        pthread_mutex_unlock(&g_shards[s].lock);
-    }
 
     void* p = real_realloc(old_ptr, size);
     if (!p) {
@@ -873,14 +531,6 @@ void free(void* ptr)
     int   frame_count = 0;
     bool  tracked = log_free_capture(ptr, "free", frames, frame_count);
 
-    if (tracked) {
-        if (!g_compact) {
-            int s = shard_of(ptr);
-            pthread_mutex_lock(&g_shards[s].lock);
-            if (g_shards[s].map) g_shards[s].map->erase(ptr);
-            pthread_mutex_unlock(&g_shards[s].lock);
-        }
-    }
     real_free(ptr);
     if (tracked) in_hook = false;
     if (tracked && frame_count > 0)
@@ -924,24 +574,11 @@ static inline void cpp_free(void* p, const char* op) noexcept
     void* frames[32];
     int   frame_count = 0;
     bool  tracked = log_free_capture(p, op, frames, frame_count);
-    // If tracked, in_hook is now TRUE — we own the cleanup.
 
-    // Erase from the shard and physically free while in_hook=true.
-    // Any reentrant free(p) during this window sees in_hook=true and exits
-    // early, so real_free cannot be called twice.
-    if (tracked) {
-        if (!g_compact) {
-            int s = shard_of(p);
-            pthread_mutex_lock(&g_shards[s].lock);
-            if (g_shards[s].map) g_shards[s].map->erase(p);
-            pthread_mutex_unlock(&g_shards[s].lock);
-        }
-    }
     real_free(p);
 
-    // Clear in_hook AFTER real_free: ptr is now gone from both g_map and
-    // the heap.  If a destructor chain during print_frames tries to free p
-    // again, log_free_capture won't find it in g_map → silent no-op.
+    // Clear in_hook AFTER real_free so reentrant free(p) during print_frames
+    // sees in_hook=true and exits early (double-free guard).
     if (tracked) in_hook = false;
 
     if (tracked && frame_count > 0)

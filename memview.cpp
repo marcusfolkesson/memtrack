@@ -88,7 +88,7 @@ struct ParseState {
     vector<ThreadInfo>           threads;
     unordered_map<int, size_t>   tid_idx;        // tid → threads index
 
-    enum class Last { NONE, ALLOC, FREE, LEAK } last = Last::NONE;
+    enum class Last { NONE, ALLOC, FREE } last = Last::NONE;
     size_t last_rec = 0;
 
     ThreadInfo& thread(int tid, const string& name) {
@@ -128,8 +128,7 @@ static void parse_line(const char* line, ParseState& st)
         string sym = rtrim(p);
         if (st.last == ParseState::Last::ALLOC && st.last_rec < st.records.size())
             st.records[st.last_rec].frames.push_back(sym);
-        else if ((st.last == ParseState::Last::FREE || st.last == ParseState::Last::LEAK)
-                 && st.last_rec < st.records.size())
+        else if (st.last == ParseState::Last::FREE && st.last_rec < st.records.size())
             st.records[st.last_rec].free_frames.push_back(sym);
         return;
     }
@@ -156,46 +155,14 @@ static void parse_line(const char* line, ParseState& st)
         sscanf(after, "EXIT total=%zu", &total);
         auto& th = st.thread(tid, tname);
         th.total_bytes = total;
-        // Mark this thread's still-unfreed allocations as leaked.
-        // In full mode, subsequent SUMMARY lines will overwrite th.leak_count/
-        // leak_bytes with authoritative values; in compact mode (no SUMMARY)
-        // these are the final values.
+        // memtrack emits no LEAK/SUMMARY lines — memview detects leaks by
+        // marking every still-unfreed record for this thread at exit time.
         for (auto& r : st.records) {
             if (r.tid == tid && !r.freed && !r.is_leak) {
                 r.is_leak = true;
                 th.leak_count++;
                 th.leak_bytes += r.size;
             }
-        }
-        return;
-    }
-
-    // ── SUMMARY ───────────────────────────────────────────────────────────
-    if (!strcmp(op, "SUMMARY")) {
-        size_t cnt = 0, bytes = 0;
-        if (sscanf(after, "SUMMARY %zu unfreed allocation(s), %zu bytes leaked",
-                   &cnt, &bytes) == 2) {
-            auto& th = st.thread(tid, tname);
-            th.leak_count = cnt;
-            th.leak_bytes = bytes;
-        }
-        return;
-    }
-
-    // ── LEAK (from exit report) ───────────────────────────────────────────
-    if (!strcmp(op, "LEAK")) {
-        void* ptr_raw = nullptr;
-        // Full format:    "LEAK ts=<ts> <op> size=<sz> ptr=<ptr>"
-        // Compact format: "LEAK size=<sz> ptr=<ptr>"
-        // Extract ptr= regardless of which format is present.
-        const char* pptr = strstr(after, "ptr=");
-        if (pptr) sscanf(pptr, "ptr=%p", &ptr_raw);
-        uintptr_t ptr = (uintptr_t)ptr_raw;
-        auto it = st.ptr_idx.find(ptr);
-        if (it != st.ptr_idx.end()) {
-            st.records[it->second].is_leak = true;
-            st.last     = ParseState::Last::LEAK;
-            st.last_rec = it->second;
         }
         return;
     }
@@ -275,10 +242,8 @@ static void parse_line(const char* line, ParseState& st)
 
 // Mark every remaining unfreed allocation as a leak and update thread stats.
 // Called when the log stream is complete (file EOF or TCP disconnect).
-// In compact mode memtrack never emits LEAK/SUMMARY lines, so memview is
-// responsible for detecting leaks.  In full mode this is a safe no-op
-// because those records will have already been marked via LEAK lines,
-// and SUMMARY overwrites the thread totals with authoritative values.
+// memtrack emits no LEAK/SUMMARY lines, so this is the final opportunity to
+// catch allocations in threads that never received an EXIT line (e.g. SIGKILL).
 static void finalize_leaks(ParseState& st)
 {
     for (auto& r : st.records) {
@@ -1518,7 +1483,7 @@ int main(int argc, char* argv[])
     string real_path = (path == "-") ? "/dev/stdin" : path;
     ParseState ps = parse_file(real_path, &initial_pos);
     // Non-live mode: the file is complete — mark remaining unfreed allocations
-    // as leaks (needed for compact mode which emits no LEAK/SUMMARY lines).
+    // as leaks (memtrack does not emit LEAK/SUMMARY lines).
     if (!live) finalize_leaks(ps);
 
     if (!live && ps.records.empty()) {
