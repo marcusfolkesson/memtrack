@@ -524,11 +524,19 @@ struct UI {
     GroupSortMode  group_sort      = GS_TOTAL;
     bool           group_sort_rev  = false;
     vector<LeakGroup> groups;                // populated when group_mode==true
+    uint64_t       lifetime_min_us = 0;      // 0 = disabled; hide allocations younger than this
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
     void rebuild(bool reset_scroll = true)
     {
+        // Compute max timestamp across all records (used as "now" for lifetime filter)
+        uint64_t max_ts = 0;
+        for (const auto& r : ps->records) {
+            max_ts = max(max_ts, r.timestamp_us);
+            if (r.freed) max_ts = max(max_ts, r.free_timestamp_us);
+        }
+
         visible.clear();
         for (size_t i = 0; i < ps->records.size(); i++) {
             const auto& r = ps->records[i];
@@ -536,6 +544,11 @@ struct UI {
             if (filter == F_LEAKS  && r.freed && !r.is_leak) continue;
             if (filter == F_ACTIVE && r.freed)               continue;
             if (filter == F_FREED  && !r.freed)              continue;
+            // Lifetime filter: age = time from alloc to "now" (max_ts)
+            if (lifetime_min_us > 0) {
+                uint64_t age = (max_ts >= r.timestamp_us) ? (max_ts - r.timestamp_us) : 0;
+                if (age < lifetime_min_us) continue;
+            }
             visible.push_back(i);
         }
 
@@ -754,6 +767,9 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
               sort_label[ui.sort],
               ui.sort_rev ? " ▲" : " ▼",
               leaks, fmt_size(leak_bytes).c_str());
+    if (ui.lifetime_min_us > 0) {
+        wprintw(w, "  │  Age≥%s", fmt_time_ms(ui.lifetime_min_us).c_str());
+    }
     if (ui.live) {
         wprintw(w, "  │  Follow: %s", ui.auto_follow ? "ON [F]" : "OFF[F]");
     }
@@ -1248,7 +1264,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  t/T:thread(fwd/bk)  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
+                  " q:quit  f:filter  a:age-filter  t/T:thread(fwd/bk)  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1446,6 +1462,42 @@ static void free_windows(Windows& w)
     delwin(w.detail); delwin(w.threads); delwin(w.status);
 }
 
+// ─── Input prompt helper ─────────────────────────────────────────────────────
+// Shows a one-line prompt in the given window, reads a string from the user.
+// Returns the entered string, or "" if the user pressed Esc/Ctrl-C.
+static string prompt_input(WINDOW* status_w, const char* label)
+{
+    werase(status_w);
+    wattron(status_w, COLOR_PAIR(C_FOCUS_HDR) | A_BOLD);
+    mvwprintw(status_w, 0, 0, " %s", label);
+    wattroff(status_w, COLOR_PAIR(C_FOCUS_HDR) | A_BOLD);
+    wrefresh(status_w);
+
+    curs_set(1);
+    echo();
+
+    string buf;
+    int ch;
+    while ((ch = wgetch(status_w)) != '\n' && ch != '\r' && ch != KEY_ENTER) {
+        if (ch == 27 || ch == ctrl('c')) { buf.clear(); break; }
+        if ((ch == KEY_BACKSPACE || ch == 127 || ch == '\b') && !buf.empty()) {
+            buf.pop_back();
+            // Redraw input line
+            werase(status_w);
+            wattron(status_w, COLOR_PAIR(C_FOCUS_HDR) | A_BOLD);
+            mvwprintw(status_w, 0, 0, " %s%s", label, buf.c_str());
+            wattroff(status_w, COLOR_PAIR(C_FOCUS_HDR) | A_BOLD);
+            wrefresh(status_w);
+        } else if (ch >= 32 && ch < 127) {
+            buf += (char)ch;
+        }
+    }
+
+    noecho();
+    curs_set(0);
+    return buf;
+}
+
 // ─── Main UI loop ────────────────────────────────────────────────────────────
 
 static void run(ParseState& ps, const string& filename, bool live, LiveReader* reader)
@@ -1631,6 +1683,17 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                     if (pos >= ui.threads_top + th_page)
                         ui.threads_top = pos - th_page + 1;
                 }
+            }
+            goto next_draw;
+        }
+
+        // Lifetime filter: 'a' (age) prompts for minimum age in seconds
+        if (ch == 'a') {
+            string s = prompt_input(win.status, "Min lifetime (seconds, 0=off): ");
+            if (!s.empty()) {
+                double secs = atof(s.c_str());
+                ui.lifetime_min_us = (uint64_t)(secs * 1e6);
+                ui.rebuild();
             }
             goto next_draw;
         }
