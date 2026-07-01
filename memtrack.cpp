@@ -350,20 +350,57 @@ static const char* get_thread_name()
     return thread_name;
 }
 
-// Append symbolised stack frames into buf[off..bufsize).
-// Returns the new offset (bytes written so far).  Must be called with in_hook==true.
-static int append_frames(char* buf, int off, int bufsize, void** frames, int count)
+// Write an event line + optional stack frames as a single atomic write().
+// For large events (deep template names), a heap buffer is allocated via
+// real_malloc so the output is never truncated and always ends with '\n'.
+static void write_event(const char* event_line, int event_len,
+                        void** frames, int frame_count)
 {
-    // backtrace_symbols calls malloc internally; in_hook must stay true.
-    char** syms = backtrace_symbols(frames, count);
-    if (!syms) return off;
-    for (int i = 0; i < count && off < bufsize - 1; i++) {
-        int n = snprintf(buf + off, (size_t)(bufsize - off),
-                         "[memtrack]   #%-2d %s\n", i, syms[i]);
-        if (n > 0) off += (n < bufsize - off) ? n : bufsize - off - 1;
+    // Fast path: no frames — write the event line directly.
+    if (frame_count == 0 || !frames) {
+        outfd_write(event_line, (size_t)event_len);
+        return;
     }
-    if (real_free) real_free(syms); else free(syms);
-    return off;
+
+    // Resolve symbols first so we know the exact size needed.
+    // backtrace_symbols calls malloc internally; in_hook stays true.
+    char** syms = backtrace_symbols(frames, frame_count);
+
+    // Calculate exact buffer size: event line + one line per frame.
+    int needed = event_len;
+    if (syms) {
+        for (int i = 0; i < frame_count; i++)
+            needed += 20 + (int)strlen(syms[i]) + 2; // "#NN  " + sym + "\n"
+    }
+    needed += 1; // null terminator
+
+    // Use a stack buffer for small events, heap for anything larger.
+    char  stack_buf[8192];
+    char* buf  = (needed <= (int)sizeof(stack_buf))
+                 ? stack_buf
+                 : (real_malloc ? (char*)real_malloc((size_t)needed) : nullptr);
+
+    if (!buf) {
+        // Allocation failed: emit event line alone, discard frames.
+        outfd_write(event_line, (size_t)event_len);
+        if (syms) { if (real_free) real_free(syms); else free(syms); }
+        return;
+    }
+
+    memcpy(buf, event_line, (size_t)event_len);
+    int off = event_len;
+    if (syms) {
+        for (int i = 0; i < frame_count; i++) {
+            int n = snprintf(buf + off, (size_t)(needed - off),
+                             "[memtrack]   #%-2d %s\n", i, syms[i]);
+            if (n > 0 && n < needed - off) off += n;
+        }
+        if (real_free) real_free(syms); else free(syms);
+    }
+
+    outfd_write(buf, (size_t)off);
+
+    if (buf != stack_buf) { if (real_free) real_free(buf); else free(buf); }
 }
 
 static void log_alloc(const char* op, size_t size, void* ptr)
@@ -375,9 +412,6 @@ static void log_alloc(const char* op, size_t size, void* ptr)
 
     uint64_t ts = elapsed_us();
 
-    // Capture frames before writing anything so the entire event is assembled
-    // into one buffer and written with a single write() — this prevents
-    // interleaving with concurrent threads.
     void* frames[32];
     int   frame_count = 0;
     if (g_stack_depth > 0) {
@@ -390,14 +424,12 @@ static void log_alloc(const char* op, size_t size, void* ptr)
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    char buf[4096];
-    int off = snprintf(buf, sizeof(buf),
-                       "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  total=%-12zu  ptr=%p\n",
-                       get_tid(), get_thread_name(), op,
-                       (unsigned long long)ts, size, thread_total, ptr);
-    if (off > 0 && frame_count > 0)
-        off = append_frames(buf, off, (int)sizeof(buf), frames, frame_count);
-    if (off > 0) outfd_write(buf, (size_t)off);
+    char event[256];
+    int n = snprintf(event, sizeof(event),
+                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  total=%-12zu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op,
+                     (unsigned long long)ts, size, thread_total, ptr);
+    if (n > 0) write_event(event, n, frames, frame_count);
 }
 
 // Log a free/delete event + optional frames in a single write().
@@ -423,13 +455,11 @@ static bool log_free_capture(void* ptr, const char* op,
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    char buf[4096];
-    int off = snprintf(buf, sizeof(buf),
-                       "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu  ptr=%p\n",
-                       get_tid(), get_thread_name(), op, (unsigned long long)ts, ptr);
-    if (off > 0 && frame_count > 0)
-        off = append_frames(buf, off, (int)sizeof(buf), frames, frame_count);
-    if (off > 0) outfd_write(buf, (size_t)off);
+    char event[256];
+    int n = snprintf(event, sizeof(event),
+                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu  ptr=%p\n",
+                     get_tid(), get_thread_name(), op, (unsigned long long)ts, ptr);
+    if (n > 0) write_event(event, n, frames, frame_count);
 
     return true;
 }
