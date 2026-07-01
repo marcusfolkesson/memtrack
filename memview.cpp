@@ -457,7 +457,8 @@ enum {
     C_SEL       = 6,  // black / white  (selected row)
     C_DIM       = 7,  // dim white      (stack frames, hints)
     C_THREAD    = 8,  // cyan / black   (thread info)
-    C_FOCUS_HDR = 9,  // white / cyan   (focused pane title bar)
+    C_FOCUS_HDR = 9,  // black / cyan   (focused pane title bar)
+    C_GROUP     = 10, // magenta / black (grouped entries)
 };
 
 static void init_colors()
@@ -472,10 +473,24 @@ static void init_colors()
     init_pair(C_SEL,       COLOR_BLACK,  COLOR_WHITE);
     init_pair(C_DIM,       COLOR_WHITE,  COLOR_BLACK);
     init_pair(C_THREAD,    COLOR_CYAN,   COLOR_BLACK);
-    init_pair(C_FOCUS_HDR, COLOR_BLACK,  COLOR_CYAN);
+    init_pair(C_FOCUS_HDR, COLOR_BLACK,   COLOR_CYAN);
+    init_pair(C_GROUP,     COLOR_MAGENTA, COLOR_BLACK);
 }
 
 // ─── UI state ────────────────────────────────────────────────────────────────
+
+// ─── Leak grouping ───────────────────────────────────────────────────────────
+
+struct LeakGroup {
+    string         key;          // grouping key (joined frames or "op:X")
+    vector<string> frames;       // frames from the example record
+    string         op;           // op from example record
+    string         thread_name;  // set if all records share the same thread
+    int            tid    = -1;  // set if all records share the same thread
+    size_t         count      = 0;
+    size_t         total_size = 0;
+    size_t         example_idx = 0;  // index into ps->records (for detail pane)
+};
 
 enum FilterMode { F_ALL, F_LEAKS, F_ACTIVE, F_FREED, F_COUNT };
 static const char* filter_label[] = { "All", "Leaks", "Active", "Freed" };
@@ -485,6 +500,7 @@ static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
 
 enum ThreadSortMode { TS_NET, TS_NAME, TS_TID, TS_ALLOC, TS_FREED, TS_LEAKS };
+enum GroupSortMode  { GS_TOTAL, GS_COUNT };  // sort modes for group view
 
 struct UI {
     ParseState*    ps           = nullptr;
@@ -504,6 +520,10 @@ struct UI {
     bool           live          = false;
     bool           auto_follow   = true; // scroll to newest in live mode
     bool           resolve_lines = false; // show addr2line source locations
+    bool           group_mode      = false;  // fold records by stack trace
+    GroupSortMode  group_sort      = GS_TOTAL;
+    bool           group_sort_rev  = false;
+    vector<LeakGroup> groups;                // populated when group_mode==true
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -550,18 +570,76 @@ struct UI {
             detail_top = 0;
             threads_top  = 0;
         } else {
-            selected = min(selected, (int)visible.size() - 1);
+            selected = min(selected, (int)(group_mode ? groups.size() : visible.size()) - 1);
             if (selected < 0) selected = 0;
         }
+        if (group_mode) rebuild_groups();
+    }
+
+    void rebuild_groups()
+    {
+        groups.clear();
+        std::unordered_map<string, size_t> key_idx;
+
+        for (size_t vi : visible) {
+            const auto& r = ps->records[vi];
+            // Key: concatenated frames, or "op:<name>" if no frames available
+            string key;
+            if (!r.frames.empty()) {
+                for (const auto& f : r.frames) { key += f; key += '\n'; }
+            } else {
+                key = "op:" + r.op;
+            }
+
+            auto it = key_idx.find(key);
+            if (it == key_idx.end()) {
+                key_idx[key] = groups.size();
+                LeakGroup g;
+                g.key         = key;
+                g.frames      = r.frames;
+                g.op          = r.op;
+                g.thread_name = r.thread_name;
+                g.tid         = r.tid;
+                g.count       = 1;
+                g.total_size  = r.size;
+                g.example_idx = vi;
+                groups.push_back(std::move(g));
+            } else {
+                auto& g = groups[it->second];
+                g.count++;
+                g.total_size += r.size;
+                if (g.tid != r.tid) { g.tid = -1; g.thread_name = ""; }
+            }
+        }
+
+        // Sort by active group sort mode
+        std::stable_sort(groups.begin(), groups.end(),
+            [this](const LeakGroup& a, const LeakGroup& b) {
+                bool less = (group_sort == GS_COUNT)
+                    ? (a.count > b.count)
+                    : (a.total_size > b.total_size);
+                return group_sort_rev ? !less : less;
+            });
+
+        selected = min(selected, max(0, (int)groups.size() - 1));
     }
 
     const AllocRecord* current() const {
+        if (group_mode) {
+            if (groups.empty()) return nullptr;
+            int idx = min(selected, (int)groups.size() - 1);
+            return &ps->records[groups[idx].example_idx];
+        }
         if (visible.empty()) return nullptr;
         return &ps->records[visible[selected]];
     }
-};
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+    const LeakGroup* current_group() const {
+        if (!group_mode || groups.empty()) return nullptr;
+        int idx = min(selected, (int)groups.size() - 1);
+        return &groups[idx];
+    }
+};
 
 static string fmt_size(size_t sz)
 {
@@ -665,16 +743,110 @@ static void draw_list(WINDOW* w, const UI& ui)
     int rows, cols; getmaxyx(w, rows, cols);
     werase(w);
 
-    // Sub-header — underline active sort column label only (no trailing spaces)
     bool list_focused = !ui.focus_detail && !ui.focus_threads;
     int  hdr_cp = list_focused ? C_FOCUS_HDR : C_HEADER;
     wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
+
+    if (ui.group_mode) {
+        // ── Grouped header with sortable columns ────────────────────────
+        mvwaddstr(w, 0, 0, " [G] ");
+
+        // gcol: underline label+arrow for active sort column
+        auto gcol = [&](const char* label, GroupSortMode m, int pad) {
+            int label_len = (int)strlen(label);
+            if (ui.group_sort == m) {
+                wattron(w, A_UNDERLINE);
+                waddstr(w, label);
+                waddstr(w, ui.group_sort_rev ? "▲" : "▼");
+                wattroff(w, A_UNDERLINE);
+                for (int i = label_len + 1; i < pad; i++) waddch(w, ' ');
+            } else {
+                waddstr(w, label);
+                for (int i = label_len; i < pad; i++) waddch(w, ' ');
+            }
+        };
+        gcol("×Count", GS_COUNT, 9);  // 8 chars + 1 space
+        waddstr(w, "  ");
+        gcol("Total", GS_TOTAL, 10);
+        waddstr(w, "  Description");
+        hline_to_eol(w, 0, hdr_cp);
+        wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
+
+        int list_rows = rows - 2;
+        for (int row = 0; row < list_rows; row++) {
+            int idx = ui.list_top + row;
+            if (idx >= (int)ui.groups.size()) break;
+
+            const LeakGroup& g = ui.groups[idx];
+            bool sel = (idx == ui.selected);
+
+            // Description: first frame (demangled) or op name
+            string desc;
+            if (!g.frames.empty()) {
+                // demangle inline — just strip module(...) wrapper if present
+                const string& f = g.frames[0];
+                auto lp = f.find('(');
+                auto rp = f.find(')', lp == string::npos ? 0 : lp);
+                if (lp != string::npos && rp != string::npos && rp > lp + 1) {
+                    string mangled = f.substr(lp + 1, rp - lp - 1);
+                    auto plus = mangled.find('+');
+                    if (plus != string::npos) mangled = mangled.substr(0, plus);
+                    int   status = -1;
+                    char* dem = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+                    desc = (status == 0 && dem) ? dem : mangled;
+                    free(dem);
+                } else {
+                    desc = f;
+                }
+            } else {
+                desc = g.op;
+            }
+            // Append thread info
+            string tinfo = g.tid != -1
+                ? ("  [" + g.thread_name + "]")
+                : "  [multiple threads]";
+
+            int cp   = C_GROUP;
+            attr_t attr = A_BOLD;
+            if (sel && !ui.focus_detail && !ui.focus_threads) { cp = C_SEL; attr = A_BOLD; }
+
+            wattron(w, COLOR_PAIR(cp) | attr);
+            char count_buf[16], size_buf[12];
+            snprintf(count_buf, sizeof(count_buf), "×%zu", g.count);
+            snprintf(size_buf,  sizeof(size_buf),  "%s", fmt_size(g.total_size).c_str());
+            mvwprintw(w, row + 1, 0, " [G] %8s  %-10s  ", count_buf, size_buf);
+
+            // Fill remaining width with truncated description + thread info
+            int used = getcurx(w);
+            int avail = max(0, cols - used);
+            string full = desc + tinfo;
+            if ((int)full.size() > avail) full = full.substr(0, avail);
+            waddstr(w, full.c_str());
+
+            if (getcury(w) == row + 1) {
+                int x = getcurx(w);
+                while (x < cols) { waddch(w, ' '); x++; }
+            }
+            wattroff(w, COLOR_PAIR(cp) | attr);
+        }
+
+        // Counter
+        wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
+        mvwprintw(w, rows - 1, 0, " %d / %d groups  [\\] ungroup",
+                  ui.groups.empty() ? 0 : ui.selected + 1,
+                  (int)ui.groups.size());
+        hline_to_eol(w, rows - 1, C_DIM);
+        wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
+        wrefresh(w);
+        return;
+    }
+
+    // ── Normal (per-record) header ──────────────────────────────────────
     mvwaddstr(w, 0, 0, " St. ");
     waddstr(w, "Pointer            ");
     waddstr(w, "Op         ");
 
-    // col: print label with underline + arrow on active column, plain otherwise.
-    // pad is the total field width including label, arrow, and trailing spaces.
+    // col: underline only the label text + arrow
     auto col = [&](const char* label, SortMode sm, int pad) {
         int label_len = (int)strlen(label);
         if (ui.sort == sm) {
@@ -682,7 +854,6 @@ static void draw_list(WINDOW* w, const UI& ui)
             waddstr(w, label);
             waddstr(w, ui.sort_rev ? "▲" : "▼");
             wattroff(w, A_UNDERLINE);
-            // fill remaining width without underline
             int used = label_len + 1;
             for (int i = used; i < pad; i++) waddch(w, ' ');
         } else {
@@ -721,7 +892,6 @@ static void draw_list(WINDOW* w, const UI& ui)
                   status, ptr_buf, r.op.c_str(),
                   fmt_time_ms(r.timestamp_us).c_str(),
                   sz.c_str(), r.thread_name.c_str());
-        // Only fill to EOL if the cursor did not wrap to the next row.
         if (getcury(w) == row + 1) {
             int x = getcurx(w);
             while (x < cols) { waddch(w, ' '); x++; }
@@ -731,7 +901,7 @@ static void draw_list(WINDOW* w, const UI& ui)
 
     // Counter
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
-    mvwprintw(w, rows - 1, 0, " %d / %d  [L]eak [A]ctive [F]reed",
+    mvwprintw(w, rows - 1, 0, " %d / %d  [L]eak [A]ctive [F]reed  [\\] group",
               ui.visible.empty() ? 0 : ui.selected + 1,
               (int)ui.visible.size());
     hline_to_eol(w, rows - 1, C_DIM);
@@ -921,7 +1091,8 @@ static void add_frames(vector<DLine>& d, const vector<string>& frames, bool reso
     }
 }
 
-static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines)
+static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines,
+                                   const LeakGroup* grp = nullptr)
 {
     vector<DLine> d;
     auto add = [&](string t, int cp = C_NORMAL, int attr = 0) {
@@ -930,6 +1101,21 @@ static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines)
     auto sep = [&](const char* title, int cp = C_HEADER) {
         add(string("── ") + title + " ", cp, A_BOLD);
     };
+
+    // Group summary header (when in group mode)
+    if (grp) {
+        sep("Group summary");
+        add("");
+        add("  Count   : " + std::to_string(grp->count) + " allocations", C_LEAK, A_BOLD);
+        add("  Total   : " + fmt_size(grp->total_size),                    C_LEAK, A_BOLD);
+        if (grp->tid != -1)
+            add("  Thread  : " + grp->thread_name + " (" + std::to_string(grp->tid) + ")",
+                C_THREAD);
+        else
+            add("  Threads : multiple", C_THREAD);
+        add("");
+        sep("Representative allocation");
+    }
 
     char ptr_buf[24];
     snprintf(ptr_buf, sizeof(ptr_buf), "0x%" PRIxPTR, r.ptr);
@@ -994,7 +1180,7 @@ static void draw_detail(WINDOW* w, const UI& ui)
         return;
     }
 
-    auto detail  = build_detail(*r, ui.resolve_lines);
+    auto detail  = build_detail(*r, ui.resolve_lines, ui.current_group());
     int  visible = rows - 2;    // -1 header -1 scrollbar
 
     // Clamp detail_top (INT_MAX is used as "jump to bottom" sentinel).
@@ -1423,10 +1609,21 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             goto next_draw;
         }
 
+        // Toggle group mode (folds visible records by stack trace)
+        if (ch == '\\') {
+            ui.group_mode = !ui.group_mode;
+            ui.selected   = 0;
+            ui.list_top   = 0;
+            ui.detail_top = 0;
+            if (ui.group_mode) ui.rebuild_groups();
+            goto next_draw;
+        }
+
         if (!ui.focus_detail && !ui.focus_threads) {
             // ── List navigation ──────────────────────────────────────────
             int h, w2; getmaxyx(win.list, h, w2); (void)w2;
             int page = h - 2;
+            int list_size = ui.group_mode ? (int)ui.groups.size() : (int)ui.visible.size();
 
             if ((ch == KEY_UP || ch == 'k') && ui.selected > 0) {
                 ui.selected--;
@@ -1435,7 +1632,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 // jump away while the user is browsing.
                 if (live) ui.auto_follow = false;
                 ensure_visible();
-            } else if ((ch == KEY_DOWN || ch == 'j') && ui.selected < (int)ui.visible.size()-1) {
+            } else if ((ch == KEY_DOWN || ch == 'j') && ui.selected < list_size - 1) {
                 ui.selected++;
                 ui.detail_top = 0;
                 if (live) ui.auto_follow = false;
@@ -1446,15 +1643,15 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.detail_top = 0;
                 if (live) ui.auto_follow = false;
             } else if (ch == KEY_NPAGE || ch == ctrl('f')) {
-                ui.selected = min((int)ui.visible.size()-1, ui.selected + page);
-                ui.list_top = min(max(0,(int)ui.visible.size()-page), ui.list_top+page);
+                ui.selected = min(list_size - 1, ui.selected + page);
+                ui.list_top = min(max(0, list_size - page), ui.list_top + page);
                 ui.detail_top = 0;
                 if (live) ui.auto_follow = false;
             } else if (ch == KEY_HOME || ch == 'g') {
                 ui.selected = 0; ui.list_top = 0; ui.detail_top = 0;
                 if (live) ui.auto_follow = false;
             } else if (ch == KEY_END || ch == 'G') {
-                ui.selected = max(0, (int)ui.visible.size()-1);
+                ui.selected = max(0, list_size - 1);
                 ui.list_top = max(0, ui.selected - page + 1);
                 ui.detail_top = 0;
                 // G = jump to bottom → re-enable auto-follow
@@ -1463,17 +1660,29 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.filter = (FilterMode)((ui.filter + 1) % F_COUNT);
                 ui.rebuild();
             } else if (ch == 's') {
-                SortMode next = (SortMode)((ui.sort + 1) % S_COUNT);
-                if (next == ui.sort)
-                    ui.sort_rev = !ui.sort_rev;
-                else {
-                    ui.sort_rev = false;
-                    ui.sort = next;
+                if (ui.group_mode) {
+                    // Cycle group sort: Total → Count → Total
+                    ui.group_sort = (ui.group_sort == GS_TOTAL) ? GS_COUNT : GS_TOTAL;
+                    ui.group_sort_rev = false;
+                    ui.rebuild_groups();
+                } else {
+                    SortMode next = (SortMode)((ui.sort + 1) % S_COUNT);
+                    if (next == ui.sort)
+                        ui.sort_rev = !ui.sort_rev;
+                    else {
+                        ui.sort_rev = false;
+                        ui.sort = next;
+                    }
+                    ui.rebuild();
                 }
-                ui.rebuild();
             } else if (ch == 'S') {
-                ui.sort_rev = !ui.sort_rev;
-                ui.rebuild();
+                if (ui.group_mode) {
+                    ui.group_sort_rev = !ui.group_sort_rev;
+                    ui.rebuild_groups();
+                } else {
+                    ui.sort_rev = !ui.sort_rev;
+                    ui.rebuild();
+                }
             } else if (ch == '1') {
                 ui.sort_rev = (ui.sort == S_TIME) ? !ui.sort_rev : false;
                 ui.sort = S_TIME; ui.rebuild();
