@@ -482,6 +482,8 @@ enum SortMode  { S_TIME, S_SIZE, S_THREAD, S_COUNT };
 static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
 
+enum ThreadSortMode { TS_NET, TS_NAME, TS_ALLOC, TS_FREED, TS_LEAKS };
+
 struct UI {
     ParseState*    ps           = nullptr;
     vector<size_t> visible;        // indices into ps->records
@@ -495,6 +497,8 @@ struct UI {
     bool           focus_detail  = false;
     bool           focus_hotfn  = false;
     int            hotfn_top    = 0;    // scroll offset in hot-fn pane
+    ThreadSortMode thread_sort     = TS_NET;  // Thread Summary sort column
+    bool           thread_sort_rev = false;   // reverse Thread Summary sort
     bool           live          = false;
     bool           auto_follow   = true; // scroll to newest in live mode
     bool           resolve_lines = false; // show addr2line source locations
@@ -1001,48 +1005,56 @@ static void draw_detail(WINDOW* w, const UI& ui)
     wrefresh(w);
 }
 
-// ─── Draw: status / thread bar ───────────────────────────────────────────────
+// ─── Draw: status bar ────────────────────────────────────────────────────────
 
 static void draw_status(WINDOW* w, const UI& ui)
 {
-    int rows, cols; getmaxyx(w, rows, cols); (void)rows;
+    int rows, cols; getmaxyx(w, rows, cols); (void)rows; (void)cols;
     werase(w);
-
-    // Thread summary
-    wattron(w, COLOR_PAIR(C_THREAD));
-    mvwaddstr(w, 0, 0, " Threads:");
-    for (const auto& th : ui.ps->threads) {
-        char buf[64];
-        if (th.leak_count > 0)
-            snprintf(buf, sizeof(buf), "  %s[%s total, LEAK %s]",
-                     th.name.c_str(),
-                     fmt_size(th.total_bytes).c_str(),
-                     fmt_size(th.leak_bytes).c_str());
-        else
-            snprintf(buf, sizeof(buf), "  %s[%s]",
-                     th.name.c_str(), fmt_size(th.total_bytes).c_str());
-        if (getcurx(w) + (int)strlen(buf) < cols)
-            waddstr(w, buf);
-    }
-    hline_to_eol(w, 0, C_THREAD);
-    wattroff(w, COLOR_PAIR(C_THREAD));
 
     // Key hints
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
     if (ui.focus_hotfn)
-        mvwprintw(w, 1, 0,
-                  " j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
+        mvwprintw(w, 0, 0,
+                  " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
-        mvwprintw(w, 1, 0,
+        mvwprintw(w, 0, 0,
                   " q:quit  f:filter  t/T:thread(fwd/bk)  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
                   ui.live ? "  F:follow" : "");
-    hline_to_eol(w, 1, C_DIM);
+    hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
 
     wrefresh(w);
 }
 
-// ─── Draw: hot functions pane ────────────────────────────────────────────────
+// ─── Thread Summary sort helper ──────────────────────────────────────────────
+
+// Returns the ThreadInfo pointers sorted by the current thread sort mode.
+// Used by both draw_threads and the t/T cycling code to guarantee consistency.
+static vector<const ThreadInfo*> sorted_threads(const UI& ui)
+{
+    const auto& threads = ui.ps->threads;
+    vector<const ThreadInfo*> sv;
+    sv.reserve(threads.size());
+    for (auto& t : threads) sv.push_back(&t);
+
+    auto cmp = [&](const ThreadInfo* a, const ThreadInfo* b) -> bool {
+        bool less = false;
+        switch (ui.thread_sort) {
+            case TS_NAME:  less = a->name < b->name; break;
+            case TS_ALLOC: less = a->allocated > b->allocated; break;
+            case TS_FREED: less = a->freed     > b->freed;     break;
+            case TS_LEAKS: less = a->leak_bytes > b->leak_bytes; break;
+            case TS_NET:   // fallthrough — default
+            default:       less = a->net() > b->net(); break;
+        }
+        return ui.thread_sort_rev ? !less : less;
+    };
+    std::stable_sort(sv.begin(), sv.end(), cmp);
+    return sv;
+}
+
+// ─── Draw: thread summary pane ───────────────────────────────────────────────
 
 static void draw_threads(WINDOW* w, const UI& ui)
 {
@@ -1059,7 +1071,7 @@ static void draw_threads(WINDOW* w, const UI& ui)
 
     // Title row
     wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
-    mvwaddstr(w, 0, 0, focused ? " Threads [j/k:scroll  Tab:unfocus]" :
+    mvwaddstr(w, 0, 0, focused ? " Threads [s/S:sort  j/k:scroll  Tab:unfocus]" :
                                  " Thread summary");
     if (ui.tid_filter != -1) {
         for (auto& t : threads)
@@ -1075,26 +1087,45 @@ static void draw_threads(WINDOW* w, const UI& ui)
     }
     hline_to_eol(w, 0, C_HEADER);
 
-    // Column header
+    // Column header — active sort column is underlined.
     // Fixed non-name portion: 2+7(TID)+2+10+2+10+2+10+2+16(leaks) = 63 chars.
     // Reserve 1 leading space → name_w = cols - 64.
     int name_w = max(8, cols - 64);
-    mvwprintw(w, 1, 0, " %-*s  %7s  %10s  %10s  %10s  %-16s",
-              name_w, "Thread", "TID", "Allocated", "Freed", "Net(live)", "Leaks");
+    const char* arrow = ui.thread_sort_rev ? " ▲" : " ▼";
+
+    auto col = [&](ThreadSortMode m, const char* label, int w2) {
+        bool active = (ui.thread_sort == m);
+        if (active) wattron(w, A_UNDERLINE);
+        wprintw(w, active ? (ui.thread_sort_rev ? "%-*s▲" : "%-*s▼") : "%-*s ",
+                w2 - 1, label);
+        if (active) wattroff(w, A_UNDERLINE);
+    };
+    (void)arrow;
+
+    wmove(w, 1, 0);
+    wprintw(w, " ");
+    // Name column (variable width)
+    if (ui.thread_sort == TS_NAME) wattron(w, A_UNDERLINE);
+    wprintw(w, ui.thread_sort == TS_NAME
+               ? (ui.thread_sort_rev ? "%-*s▲" : "%-*s▼")
+               : "%-*s ", name_w - 1, "Thread");
+    if (ui.thread_sort == TS_NAME) wattroff(w, A_UNDERLINE);
+    wprintw(w, "  %7s  ", "TID");
+    col(TS_ALLOC, "Allocated", 10);
+    wprintw(w, "  ");
+    col(TS_FREED, "Freed", 10);
+    wprintw(w, "  ");
+    col(TS_NET, "Net(live)", 10);
+    wprintw(w, "  ");
+    col(TS_LEAKS, "Leaks", 16);
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
-    // Data rows — sorted by net descending
-    vector<const ThreadInfo*> sorted;
-    sorted.reserve(threads.size());
-    for (auto& t : threads) sorted.push_back(&t);
-    std::stable_sort(sorted.begin(), sorted.end(),
-                     [](const ThreadInfo* a, const ThreadInfo* b) {
-                         return a->net() > b->net();
-                     });
+    // Data rows
+    vector<const ThreadInfo*> sv = sorted_threads(ui);
 
     for (int i = 0; i < page && (top + i) < total; i++) {
-        const ThreadInfo& t = *sorted[top + i];
+        const ThreadInfo& t = *sv[top + i];
         size_t net = t.net();
         // "all threads" mode: highlight every row; otherwise only the filtered one.
         bool selected_thread = (ui.tid_filter == -1) || (ui.tid_filter == t.tid);
@@ -1146,8 +1177,8 @@ static int threads_pane_h(int n_threads)
 // Actual list pane width — shrinks to half on very narrow terminals so the
 // detail pane always gets at least 30 columns.
 static int list_pane_w() { return (COLS >= LIST_W + 30) ? LIST_W : COLS / 2; }
-// Body height: total rows minus header(2), thread pane, and status(2).
-static int body_height(int th_h)  { return max(BODY_MIN, LINES - 2 - th_h - 2); }
+// Body height: total rows minus header(2), thread pane, and status(1).
+static int body_height(int th_h)  { return max(BODY_MIN, LINES - 2 - th_h - 1); }
 
 static Windows make_windows(int th_h)
 {
@@ -1160,7 +1191,7 @@ static Windows make_windows(int th_h)
         newwin(body, lw,        2,    0),
         newwin(body, cols-lw-1, 2,    lw+1),
         newwin(th_h, cols,      th_y, 0),
-        newwin(2,    cols,      rows-2, 0),
+        newwin(1,    cols,      rows-1, 0),
     };
 }
 
@@ -1304,23 +1335,15 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             goto next_draw;
         }
 
-        // Thread filter — cycles in the same order as the Thread Summary pane
-        // (sorted by net live bytes descending).  't' = forward, 'T' = backward.
+        // Thread filter — cycles in the same order as the Thread Summary pane.
+        // 't' = forward, 'T' = backward.
         if (ch == 't' || ch == 'T') {
             if (!ps.threads.empty()) {
-                // Build sorted order identical to the Thread Summary pane.
+                // Use the same sorted order as the Thread Summary pane.
+                vector<const ThreadInfo*> sv = sorted_threads(ui);
                 vector<int> order;
-                order.reserve(ps.threads.size());
-                for (auto& t : ps.threads) order.push_back(t.tid);
-                std::stable_sort(order.begin(), order.end(),
-                    [&](int a, int b) {
-                        size_t na = 0, nb = 0;
-                        for (auto& t : ps.threads) {
-                            if (t.tid == a) na = t.net();
-                            if (t.tid == b) nb = t.net();
-                        }
-                        return na > nb;
-                    });
+                order.reserve(sv.size());
+                for (auto* t : sv) order.push_back(t->tid);
 
                 if (ch == 't') {
                     // Forward: all → order[0] → order[1] → … → all
@@ -1449,6 +1472,20 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             else if (ch == KEY_NPAGE || ch == ctrl('f')) ui.hotfn_top = min(max_top, ui.hotfn_top + page);
             else if (ch == KEY_HOME || ch == 'g') ui.hotfn_top = 0;
             else if (ch == 'G') ui.hotfn_top = max_top;
+            else if (ch == 's') {
+                // Cycle sort column forward: Net → Name → Allocated → Freed → Leaks → Net
+                const ThreadSortMode cycle[] = { TS_NAME, TS_ALLOC, TS_FREED, TS_NET, TS_LEAKS };
+                constexpr int N = (int)(sizeof(cycle)/sizeof(cycle[0]));
+                for (int i = 0; i < N; i++) {
+                    if (cycle[i] == ui.thread_sort) {
+                        ui.thread_sort = cycle[(i + 1) % N];
+                        ui.thread_sort_rev = false;
+                        break;
+                    }
+                }
+            } else if (ch == 'S') {
+                ui.thread_sort_rev = !ui.thread_sort_rev;
+            }
         }
 
         next_draw:
