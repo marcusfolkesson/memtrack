@@ -110,6 +110,7 @@ static std::atomic<int> g_outfd{STDERR_FILENO};
 static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socket)
 static size_t g_min_size       = 0;
 static int    g_stack_depth    = 0;   // 0 = stack traces disabled
+static bool   g_demangle       = false; // demangle in memtrack (default off — let memview do it)
 
 static void outfd_write(const void* buf, size_t n)
 {
@@ -452,6 +453,9 @@ static void __attribute__((constructor)) memtrack_ctor()
         long d = strtol(depth, nullptr, 10);
         g_stack_depth = (d > 0 && d <= 64) ? (int)d : 0;
     }
+
+    const char* dem = getenv("MEMTRACK_DEMANGLE");
+    if (dem) g_demangle = (dem[0] != '0' && dem[0] != '\0');
 }
 
 static inline void ensure_exit_hook()
@@ -524,18 +528,24 @@ static void print_frames(void** frames, int count)
             memcpy(mangled, lparen + 1, (size_t)name_len);
             mangled[name_len] = '\0';
 
-            // Demangle — __cxa_demangle allocates with malloc; release with real_free
-            int   status   = -1;
-            char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
-            const char* display = (status == 0 && demangled) ? demangled : mangled;
-
             // Remainder: "+0xNN) [0xADDR]"
             const char* rest = plus;
 
-            int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
+            int n;
+            if (g_demangle) {
+                // Demangle — __cxa_demangle allocates with malloc; release with real_free
+                int   status    = -1;
+                char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+                const char* display = (status == 0 && demangled) ? demangled : mangled;
+                n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
                              i, mod_len, sym, display, rest);
+                if (demangled) { if (real_free) real_free(demangled); else free(demangled); }
+            } else {
+                // Emit raw — memview (or the caller) will demangle on display
+                n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
+                             i, mod_len, sym, mangled, rest);
+            }
             if (n > 0) outfd_write(buf, (size_t)n);
-            if (demangled) { if (real_free) real_free(demangled); else free(demangled); }
         } else {
             // Fallback: print as-is
             int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, sym);

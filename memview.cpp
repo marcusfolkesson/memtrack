@@ -36,6 +36,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <cxxabi.h>
 
 using std::vector;
 using std::string;
@@ -836,15 +837,40 @@ static const string& resolve_addr2line(const string& frame)
 
 struct DLine { string text; int cp; int attr; };
 
+// Demangle the C++ symbol inside a backtrace_symbols() frame string.
+// Frame format: "module(mangled+0xNN) [0xADDR]"
+// Returns the input unchanged if no mangled name is found or demangling fails.
+static string demangle_frame(const string& frame)
+{
+    auto lp = frame.find('(');
+    if (lp == string::npos) return frame;
+    auto plus = frame.find_first_of("+)", lp + 1);
+    if (plus == string::npos || plus == lp + 1) return frame;  // empty or no name
+
+    string mangled = frame.substr(lp + 1, plus - lp - 1);
+    // Only attempt demangle for C++ mangled names (_Z prefix)
+    if (mangled.size() < 2 || mangled[0] != '_' || mangled[1] != 'Z')
+        return frame;
+
+    int   status = -1;
+    char* dem    = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+    if (status != 0 || !dem) return frame;
+
+    string result = frame.substr(0, lp + 1) + dem + frame.substr(plus);
+    free(dem);
+    return result;
+}
+
 static void add_frames(vector<DLine>& d, const vector<string>& frames, bool resolve)
 {
     auto add = [&](string t, int cp = C_NORMAL, int attr = 0) {
         d.push_back({std::move(t), cp, attr});
     };
     for (int i = 0; i < (int)frames.size(); i++) {
-        add("    #" + std::to_string(i) + "  " + frames[i], C_DIM, A_DIM);
+        string display = demangle_frame(frames[i]);
+        add("    #" + std::to_string(i) + "  " + display, C_DIM, A_DIM);
         if (resolve) {
-            const string& loc = resolve_addr2line(frames[i]);
+            const string& loc = resolve_addr2line(frames[i]);  // use raw frame for addr lookup
             if (!loc.empty())
                 add("         → " + loc, C_ALLOC, 0);
         }

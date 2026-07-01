@@ -40,6 +40,7 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_OUTPUT`      | _(stderr)_    | Write all output to this file instead of stderr. Created/truncated at startup. |
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
 | `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
+| `MEMTRACK_DEMANGLE`    | `0`           | Set to `1` to demangle C++ symbols in memtrack's log output. By default symbols are left mangled and `memview` demangled them on display. |
 
 ### TCP server mode
 
