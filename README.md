@@ -196,7 +196,7 @@ The threads pane (below the main list) shows one row per thread with these colum
 | `Net(live)` | `Allocated − Freed` — bytes currently live |
 | `Leaks`     | Number and total size of allocations logged as LEAK at exit (cancelled when later freed by another thread) |
 
-Rows are sorted by `Net(live)` descending. The currently selected thread (active filter) is highlighted bold. Press `t` to cycle the thread filter, which affects both the main list and the hot-functions pane.
+Rows are sorted by `Net(live)` descending by default. The currently selected thread (active filter) is highlighted bold. Press `t`/`T` to cycle the thread filter forward/backward, which affects both the main list and the thread summary pane.
 
 ### Keys
 
@@ -205,11 +205,11 @@ Rows are sorted by `Net(live)` descending. The currently selected thread (active
 | `↑` `↓` / `k` `j` | Navigate allocation list (or scroll active pane when focused) |
 | `PgUp` `PgDn` / `Ctrl-b` `Ctrl-f` | Scroll by page |
 | `Home` `End` / `g` `G` | Jump to top / bottom |
-| `Tab` / `→` / `l` | Cycle focus forward: **list → detail → hot-fn → list** |
+| `Tab` / `→` / `l` | Cycle focus forward: **list → detail → thread summary → list** |
 | `←` / `h` | Cycle focus backward |
 | `f` | Cycle filter: **All → Leaks → Active → Freed** |
-| `t` | Cycle thread filter |
-| `s` | Cycle sort: **Time → Size → Thread** |
+| `t` / `T` | Cycle thread filter forward / backward |
+| `s` | Cycle sort column (list pane: **Time → Size → Thread**; thread summary pane: **Name → TID → Allocated → Freed → Net(live) → Leaks**) |
 | `S` | Reverse current sort direction |
 | `1` / `2` / `3` | Sort by Time / Size / Thread directly (press again to reverse) |
 | `F` | Toggle auto-follow in live mode (re-enabled by pressing `G`) |
@@ -225,28 +225,20 @@ Manual navigation (any movement key) **pauses** auto-follow. Pressing `G` jumps 
 
 The header shows `● LIVE` (green) when auto-follow is on, `◌ LIVE` (yellow/paused) when it is not.
 
-### Hot functions pane
+### Thread summary pane
 
-At the bottom of the screen, a **7-row pane** (2 header rows + 5 data rows) lists **all unique call sites ranked by net unfreed bytes** — bytes allocated minus bytes freed for each caller. The 5 visible rows scroll independently from the rest of the UI.
+At the bottom of the screen, a pane lists all threads with their allocation statistics. When focused (press **Tab** / `l` to cycle to it), the title shows navigation hints and additional keys become active.
 
-```
-┌─ Top functions  3-7/12 ────────────────────────────────────────────────────────────────────────────────────┐
-│  Function                                               Allocated      Freed        Net (live)              │
-│  main                                                   3,072 B        2,048 B      1,024 B                 │
-│  thread_fn(void*)                                       512 B          0 B          512 B                   │
-│  malloc                                                 256 B          256 B        0 B                     │
-│  calloc                                                 128 B          128 B        0 B                     │
-│  _IO_file_doallocate                                    4,096 B        4,096 B      0 B                     │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+- **`s`** — cycle sort column: **Name → TID → Allocated → Freed → Net(live) → Leaks → Name**
+- **`S`** — toggle reverse sort direction (▲/▼ indicator appears next to the active column)
+- **`j`/`k`**, **`Ctrl-f`/`Ctrl-b`**, **`g`/`G`** — scroll when there are more threads than visible rows
+- A **scroll indicator** (`N-M/total`) appears in the title when scrollable
 
-- Press **Tab** (or `l` / `→`) to focus the hot-functions pane; its title changes to show navigation hints.  When focused, use `j`/`k`, `Ctrl-f`/`Ctrl-b`, `g`/`G` to scroll.
-- A **scroll indicator** (`N-M/total`) in the title shows the visible range.
-- Function names are extracted from `frame #0` of each allocation's stack trace (the most immediate caller of `malloc`/`new`/etc.).
-- When no stack trace is available (e.g., `MEMTRACK_STACK_DEPTH=0`), the grouping key falls back to the raw operation name (`malloc`, `calloc`, …).
-- The pane respects the current **thread filter** (`t` key).
-- The top offender (net > 0) is highlighted **bold red**; others with unfreed bytes are **red**; fully freed functions are **green**.
-- For functions to appear by name, the binary must be compiled with `-rdynamic` and the relevant functions must not be `static` (static symbols are invisible to `backtrace_symbols()`). Inlined functions will appear under the caller's name; use `__attribute__((noinline))` on hot functions to get accurate attribution.
+The active pane title bar is highlighted in **cyan** so it is always clear which pane has keyboard focus.
+
+The pane respects the current **thread filter** (`t`/`T` keys): the filtered thread row is highlighted, and when all threads are selected every row is highlighted.
+
+- For function names to appear in stack traces, compile with `-rdynamic`; inlined functions appear under the caller's name — use `__attribute__((noinline))` on allocating functions for accurate attribution.
 
 ---
 

@@ -10,7 +10,7 @@
  *
  * Keys:
  *   ↑ ↓  PgUp PgDn  Home End   Navigate allocation list
- *   Tab / ← →                  Switch focus: list ↔ detail ↔ hot-fn pane
+ *   Tab / ← →                  Switch focus: list ↔ detail ↔ thread summary pane
  *   f                           Cycle filter: All → Leaks → Active → Freed
  *   t / T                       Cycle thread filter forward / backward (Thread Summary order)
  *   F                           Toggle auto-follow (live mode)
@@ -497,8 +497,8 @@ struct UI {
     int            list_top      = 0;    // scroll offset in list pane
     int            detail_top    = 0;    // scroll offset in detail pane
     bool           focus_detail  = false;
-    bool           focus_hotfn  = false;
-    int            hotfn_top    = 0;    // scroll offset in hot-fn pane
+    bool           focus_threads = false;
+    int            threads_top   = 0;    // scroll offset in thread summary pane
     ThreadSortMode thread_sort     = TS_NET;  // Thread Summary sort column
     bool           thread_sort_rev = false;   // reverse Thread Summary sort
     bool           live          = false;
@@ -548,7 +548,7 @@ struct UI {
             selected   = 0;
             list_top   = 0;
             detail_top = 0;
-            hotfn_top  = 0;
+            threads_top  = 0;
         } else {
             selected = min(selected, (int)visible.size() - 1);
             if (selected < 0) selected = 0;
@@ -666,7 +666,7 @@ static void draw_list(WINDOW* w, const UI& ui)
     werase(w);
 
     // Sub-header — underline active sort column label only (no trailing spaces)
-    bool list_focused = !ui.focus_detail && !ui.focus_hotfn;
+    bool list_focused = !ui.focus_detail && !ui.focus_threads;
     int  hdr_cp = list_focused ? C_FOCUS_HDR : C_HEADER;
     wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
     mvwaddstr(w, 0, 0, " St. ");
@@ -712,8 +712,8 @@ static void draw_list(WINDOW* w, const UI& ui)
         string sz = fmt_size(r.size);
 
         int cp = r.is_leak ? C_LEAK : (r.freed ? C_FREE : C_ALLOC);
-        if (sel && !ui.focus_detail && !ui.focus_hotfn) cp = C_SEL;
-        attr_t attr = (sel && !ui.focus_detail && !ui.focus_hotfn) ? A_BOLD : 0;
+        if (sel && !ui.focus_detail && !ui.focus_threads) cp = C_SEL;
+        attr_t attr = (sel && !ui.focus_detail && !ui.focus_threads) ? A_BOLD : 0;
         if (r.is_leak) attr |= A_BOLD;
 
         wattron(w, COLOR_PAIR(cp) | attr);
@@ -976,7 +976,7 @@ static void draw_detail(WINDOW* w, const UI& ui)
     werase(w);
 
     // Sub-header
-    bool focused = ui.focus_detail && !ui.focus_hotfn;
+    bool focused = ui.focus_detail && !ui.focus_threads;
     int  hdr_cp  = focused ? C_FOCUS_HDR : C_HEADER;
     wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
     mvwprintw(w, 0, 0, " Detail%s%s",
@@ -1031,7 +1031,7 @@ static void draw_status(WINDOW* w, const UI& ui)
 
     // Key hints
     wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
-    if (ui.focus_hotfn)
+    if (ui.focus_threads)
         mvwprintw(w, 0, 0,
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
@@ -1079,13 +1079,13 @@ static void draw_threads(WINDOW* w, const UI& ui)
     int rows, cols; getmaxyx(w, rows, cols);
     werase(w);
 
-    bool focused = ui.focus_hotfn;
+    bool focused = ui.focus_threads;
 
     const auto& threads = ui.ps->threads;
     int  total = (int)threads.size();
     int  page  = rows - 2;
 
-    int top = max(0, min(ui.hotfn_top, max(0, total - page)));
+    int top = max(0, min(ui.threads_top, max(0, total - page)));
 
     // Title row
     int hdr_cp = focused ? C_FOCUS_HDR : C_HEADER;
@@ -1188,7 +1188,7 @@ static void draw_threads(WINDOW* w, const UI& ui)
 // ─── Window management ───────────────────────────────────────────────────────
 
 struct Windows {
-    WINDOW *header, *list, *detail, *hotfn, *status;
+    WINDOW *header, *list, *detail, *threads, *status;
 };
 
 // Exact column width required for the list pane:
@@ -1231,7 +1231,7 @@ static Windows make_windows(int th_h)
 static void free_windows(Windows& w)
 {
     delwin(w.header); delwin(w.list);
-    delwin(w.detail); delwin(w.hotfn); delwin(w.status);
+    delwin(w.detail); delwin(w.threads); delwin(w.status);
 }
 
 // ─── Main UI loop ────────────────────────────────────────────────────────────
@@ -1277,7 +1277,7 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         draw_header(win.header, ui, filename, reader);
         draw_list(win.list, ui);
         draw_detail(win.detail, ui);
-        draw_threads(win.hotfn, ui);
+        draw_threads(win.threads, ui);
         draw_status(win.status, ui);
     };
 
@@ -1332,23 +1332,23 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             continue;
         }
 
-        // Pane switch: Tab / h / l cycles  list → detail → hotfn → list
+        // Pane switch: Tab / h / l cycles  list → detail → threads → list
         //             h / left  : backward;  l / right / Tab : forward
         if (ch == '\t' || ch == KEY_LEFT || ch == KEY_RIGHT ||
             ch == 'h'  || ch == 'l') {
             bool fwd = (ch == '\t' || ch == KEY_RIGHT || ch == 'l');
-            if (!ui.focus_detail && !ui.focus_hotfn) {
-                // list → detail (fwd) or list → hotfn (bwd)
-                if (fwd) { ui.focus_detail = true;  ui.focus_hotfn = false; }
-                else     { ui.focus_detail = false; ui.focus_hotfn = true;  }
+            if (!ui.focus_detail && !ui.focus_threads) {
+                // list → detail (fwd) or list → threads (bwd)
+                if (fwd) { ui.focus_detail = true;  ui.focus_threads = false; }
+                else     { ui.focus_detail = false; ui.focus_threads = true;  }
             } else if (ui.focus_detail) {
-                // detail → hotfn (fwd) or detail → list (bwd)
-                if (fwd) { ui.focus_detail = false; ui.focus_hotfn = true;  }
-                else     { ui.focus_detail = false; ui.focus_hotfn = false; }
+                // detail → threads (fwd) or detail → list (bwd)
+                if (fwd) { ui.focus_detail = false; ui.focus_threads = true;  }
+                else     { ui.focus_detail = false; ui.focus_threads = false; }
             } else {
-                // hotfn → list (fwd) or hotfn → detail (bwd)
-                if (fwd) { ui.focus_detail = false; ui.focus_hotfn = false; }
-                else     { ui.focus_detail = true;  ui.focus_hotfn = false; }
+                // threads → list (fwd) or threads → detail (bwd)
+                if (fwd) { ui.focus_detail = false; ui.focus_threads = false; }
+                else     { ui.focus_detail = true;  ui.focus_threads = false; }
             }
             redraw();
             continue;
@@ -1407,23 +1407,23 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.rebuild();
 
                 // Scroll the Thread Summary pane so the selected thread is visible.
-                // Must happen AFTER rebuild() since rebuild(reset_scroll=true) resets hotfn_top.
+                // Must happen AFTER rebuild() since rebuild(reset_scroll=true) resets threads_top.
                 if (ui.tid_filter != -1) {
                     int pos = 0;
                     for (size_t i = 0; i < order.size(); i++) {
                         if (order[i] == ui.tid_filter) { pos = (int)i; break; }
                     }
                     int th_page = threads_pane_h((int)ps.threads.size()) - THREADS_HDR;
-                    if (pos < ui.hotfn_top)
-                        ui.hotfn_top = pos;
-                    if (pos >= ui.hotfn_top + th_page)
-                        ui.hotfn_top = pos - th_page + 1;
+                    if (pos < ui.threads_top)
+                        ui.threads_top = pos;
+                    if (pos >= ui.threads_top + th_page)
+                        ui.threads_top = pos - th_page + 1;
                 }
             }
             goto next_draw;
         }
 
-        if (!ui.focus_detail && !ui.focus_hotfn) {
+        if (!ui.focus_detail && !ui.focus_threads) {
             // ── List navigation ──────────────────────────────────────────
             int h, w2; getmaxyx(win.list, h, w2); (void)w2;
             int page = h - 2;
@@ -1499,12 +1499,12 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             int page  = threads_pane_h((int)ps.threads.size()) - THREADS_HDR;
             int total = (int)ps.threads.size();
             int max_top = max(0, total - page);
-            if      (ch == KEY_UP   || ch == 'k') ui.hotfn_top = max(0, ui.hotfn_top - 1);
-            else if (ch == KEY_DOWN || ch == 'j') ui.hotfn_top = min(max_top, ui.hotfn_top + 1);
-            else if (ch == KEY_PPAGE || ch == ctrl('b')) ui.hotfn_top = max(0, ui.hotfn_top - page);
-            else if (ch == KEY_NPAGE || ch == ctrl('f')) ui.hotfn_top = min(max_top, ui.hotfn_top + page);
-            else if (ch == KEY_HOME || ch == 'g') ui.hotfn_top = 0;
-            else if (ch == 'G') ui.hotfn_top = max_top;
+            if      (ch == KEY_UP   || ch == 'k') ui.threads_top = max(0, ui.threads_top - 1);
+            else if (ch == KEY_DOWN || ch == 'j') ui.threads_top = min(max_top, ui.threads_top + 1);
+            else if (ch == KEY_PPAGE || ch == ctrl('b')) ui.threads_top = max(0, ui.threads_top - page);
+            else if (ch == KEY_NPAGE || ch == ctrl('f')) ui.threads_top = min(max_top, ui.threads_top + page);
+            else if (ch == KEY_HOME || ch == 'g') ui.threads_top = 0;
+            else if (ch == 'G') ui.threads_top = max_top;
             else if (ch == 's') {
                 // Cycle sort column forward: Net → Name → Allocated → Freed → Leaks → Net
                 const ThreadSortMode cycle[] = { TS_NAME, TS_TID, TS_ALLOC, TS_FREED, TS_NET, TS_LEAKS };
@@ -1554,12 +1554,12 @@ int main(int argc, char* argv[])
     string path;
     string save_path;   // --save / -o <file>
 
-    bool dump_hotfn = false;
+    bool dump_threads = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--follow"))
             live = true;
-        else if (!strcmp(argv[i], "--dump-hotfn"))
-            dump_hotfn = true;
+        else if (!strcmp(argv[i], "--dump-threads"))
+            dump_threads = true;
         else if ((!strcmp(argv[i], "--save") || !strcmp(argv[i], "-o")) && i+1 < argc)
             save_path = argv[++i];
         else if (argv[i][0] != '-' || !strcmp(argv[i], "-"))
@@ -1627,7 +1627,7 @@ int main(int argc, char* argv[])
     }
 
     // Diagnostic mode: dump thread summary and exit (no ncurses).
-    if (dump_hotfn) {
+    if (dump_threads) {
         printf("Records: %zu  |  Threads: %zu\n\n",
                ps.records.size(), ps.threads.size());
         printf("  %-20s  %8s  %12s  %12s  %12s\n",
