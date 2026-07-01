@@ -533,6 +533,73 @@ struct UI {
     uint64_t       mark_ts     = 0;          // timestamp of mark point (µs)
     bool           show_timeline = true;     // show sparkline timeline in header
 
+    // Persistent timeline markers (M key)
+    struct Marker { uint64_t ts; int id; };  // id = 1..9
+    vector<Marker> markers;                  // kept sorted by ts
+    int            next_marker_id = 1;
+
+    // Range filter: show only records allocated in [range_start, range_end]
+    bool     range_active = false;
+    uint64_t range_start  = 0;
+    uint64_t range_end    = 0;
+
+    // Whether a record is currently selected (valid index).
+    bool has_selection() const {
+        if (selected < 0) return false;
+        if (group_mode) return selected < (int)groups.size();
+        return !visible.empty() && selected < (int)visible.size();
+    }
+
+    // Timestamp of currently selected record (0 if nothing selected).
+    uint64_t selected_ts() const {
+        if (!has_selection()) return 0;
+        if (group_mode) {
+            if (selected >= (int)groups.size()) return 0;
+            // Use example record from the group
+            size_t ex = groups[selected].example_idx;
+            return ex < ps->records.size() ? ps->records[ex].timestamp_us : 0;
+        }
+        if (visible.empty() || selected >= (int)visible.size()) return 0;
+        return ps->records[visible[selected]].timestamp_us;
+    }
+
+    // Add a marker at ts; keeps markers sorted; returns its id (0 if full).
+    int add_marker(uint64_t ts) {
+        if (markers.size() >= 9) return 0;
+        Marker m{ts, next_marker_id++};
+        int id = m.id;
+        markers.insert(
+            std::lower_bound(markers.begin(), markers.end(), m,
+                             [](const Marker& a, const Marker& b){ return a.ts < b.ts; }),
+            m);
+        return id;
+    }
+
+    // Remove the marker whose timestamp is closest to ts.
+    void remove_nearest_marker(uint64_t ts) {
+        if (markers.empty()) return;
+        auto it = std::min_element(markers.begin(), markers.end(),
+                                   [ts](const Marker& a, const Marker& b){
+                                       uint64_t da = (a.ts > ts) ? a.ts - ts : ts - a.ts;
+                                       uint64_t db = (b.ts > ts) ? b.ts - ts : ts - b.ts;
+                                       return da < db;
+                                   });
+        markers.erase(it);
+    }
+
+    // Snap to nearest marker at or before ts (for range start), or ts itself.
+    uint64_t snap_left(uint64_t ts) const {
+        uint64_t best = ts;
+        for (const auto& m : markers) if (m.ts <= ts) best = m.ts;
+        return best;
+    }
+
+    // Snap to nearest marker at or after ts (for range end), or ts itself.
+    uint64_t snap_right(uint64_t ts) const {
+        for (const auto& m : markers) if (m.ts >= ts) return m.ts;
+        return ts;
+    }
+
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
     void rebuild(bool reset_scroll = true)
@@ -558,6 +625,8 @@ struct UI {
             }
             // Delta filter: only show allocations that appeared after the mark point
             if (delta_mode && r.timestamp_us <= mark_ts) continue;
+            // Range filter: only show allocations within [range_start, range_end]
+            if (range_active && (r.timestamp_us < range_start || r.timestamp_us > range_end)) continue;
             // Symbol search: case-insensitive substring across frames, thread, op, ptr
             if (!search_str.empty()) {
                 auto ci_contains = [&](const string& haystack) {
@@ -801,6 +870,15 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
               sort_label[ui.sort],
               ui.sort_rev ? " ▲" : " ▼",
               leaks, fmt_size(leak_bytes).c_str());
+    if (ui.range_active) {
+        wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+        wattron(w, COLOR_PAIR(C_GROUP) | A_BOLD);
+        wprintw(w, "  │  ▶◀ RANGE %s – %s",
+                fmt_time_ms(ui.range_start).c_str(),
+                fmt_time_ms(ui.range_end).c_str());
+        wattroff(w, COLOR_PAIR(C_GROUP) | A_BOLD);
+        wattron(w, COLOR_PAIR(C_HEADER) | A_BOLD);
+    }
     if (ui.delta_mode) {
         // Highlight the delta marker prominently so it's impossible to miss
         wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
@@ -821,18 +899,26 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
     hline_to_eol(w, 1, C_HEADER);
     wattroff(w, COLOR_PAIR(C_HEADER) | A_BOLD);
 
-    // Row 2: timeline sparkline (toggle with 'T')
+    // Row 2: timeline sparkline (toggle with 'Z')
     if (ui.show_timeline) {
         static const wchar_t bars[] = L" ▁▂▃▄▅▆▇█";
         int height, cols_; getmaxyx(w, height, cols_); (void)height;
-        int tw = cols_ - 2;  // usable width for sparkline
 
         const auto& recs = ui.ps->records;
-        // Filter to selected thread when a thread filter is active
         int tid_f = ui.tid_filter;
-        // Count matching records to detect empty
         bool any = false;
         for (const auto& r : recs) if (tid_f == -1 || r.tid == tid_f) { any = true; break; }
+
+        // Resolve thread label (shown left of sparkline when thread is filtered)
+        string tname;
+        int bar_x = 1;   // x-position where the sparkline starts
+        if (tid_f != -1) {
+            for (const auto& t : ui.ps->threads)
+                if (t.tid == tid_f) { tname = t.name; break; }
+            bar_x = 2 + (int)tname.size() + 3;  // " [name] "
+        }
+        int span_lbl_w = 10;  // reserve space for the right-side duration label
+        int tw = max(1, cols_ - bar_x - span_lbl_w);  // sparkline cell count
 
         if (tw > 4 && any) {
             // Find time range for the selected thread (or all)
@@ -865,42 +951,73 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
             int64_t running = 0;
             for (int i = 0; i < tw; i++) { running += net[i]; live[i] = running; peak = max(peak, running); }
 
-            // Left label: thread name if filtered
+            // Draw left label
             if (tid_f != -1) {
-                string tname;
-                for (const auto& t : ui.ps->threads)
-                    if (t.tid == tid_f) { tname = t.name; break; }
                 wattron(w, COLOR_PAIR(C_THREAD));
                 mvwprintw(w, 2, 0, " [%s] ", tname.empty() ? "?" : tname.c_str());
                 wattroff(w, COLOR_PAIR(C_THREAD));
-                int used = 2 + (int)tname.size() + 3;
-                tw = max(1, cols_ - used - (int)strlen(" 0.000s"));
-                mvwaddstr(w, 2, used, "");
             } else {
                 mvwaddstr(w, 2, 0, " ");
             }
+            wmove(w, 2, bar_x);
 
             for (int i = 0; i < tw; i++) {
                 int64_t v = max<int64_t>(0, live[i]);
                 int lvl = (int)(v * 8 / peak);
                 lvl = max(0, min(8, lvl));
                 bool growing = net[i] >= 0;
+
+                // Compute this column's timestamp for range checks
+                uint64_t col_ts = t_min + (uint64_t)i * (uint64_t)span / (uint64_t)max(1, tw - 1);
+
                 // Delta mark column
                 if (ui.delta_mode && ui.mark_ts > t_min) {
                     int mark_col = (int)(((ui.mark_ts - t_min) * (uint64_t)tw) / (span + 1));
                     if (i == min(tw - 1, mark_col)) {
-                        wattron(w, COLOR_PAIR(C_LEAK) | A_BOLD);
+                        wattron(w, COLOR_PAIR(C_FREE) | A_BOLD);
                         waddch(w, '|');
-                        wattroff(w, COLOR_PAIR(C_LEAK) | A_BOLD);
+                        wattroff(w, COLOR_PAIR(C_FREE) | A_BOLD);
                         continue;
                     }
                 }
+
+                // Range shading: dim columns outside range, bold inside
+                bool in_range = !ui.range_active ||
+                                (col_ts >= ui.range_start && col_ts <= ui.range_end);
+
+                // Range boundary columns
+                if (ui.range_active) {
+                    int sc = (int)(((ui.range_start - t_min) * (uint64_t)tw) / (span + 1));
+                    int ec = (int)(((ui.range_end   - t_min) * (uint64_t)tw) / (span + 1));
+                    sc = max(0, min(tw - 1, sc));
+                    ec = max(0, min(tw - 1, ec));
+                    if (i == sc || i == ec) {
+                        wattron(w, COLOR_PAIR(C_GROUP) | A_BOLD);
+                        waddch(w, i == sc ? '[' : ']');
+                        wattroff(w, COLOR_PAIR(C_GROUP) | A_BOLD);
+                        continue;
+                    }
+                }
+
+                int cp = growing ? C_ALLOC : C_FREE;
+                attr_t extra = in_range ? A_BOLD : A_DIM;
                 cchar_t cc;
                 wchar_t wch[2] = { bars[lvl], 0 };
-                setcchar(&cc, wch, A_NORMAL, (short)(growing ? C_ALLOC : C_FREE), nullptr);
+                setcchar(&cc, wch, extra, (short)cp, nullptr);
                 wadd_wch(w, &cc);
             }
-            // Right label: total span
+
+            // Overlay persistent markers AFTER sparkline (always visible).
+            for (const auto& mk : ui.markers) {
+                if (mk.ts < t_min || mk.ts > t_min + span) continue;
+                int mc = (int)(((mk.ts - t_min) * (uint64_t)tw) / (span + 1));
+                mc = max(0, min(tw - 1, mc));
+                wattron(w, COLOR_PAIR(C_GROUP) | A_BOLD);
+                mvwaddch(w, 2, bar_x + mc, '0' + mk.id);
+                wattroff(w, COLOR_PAIR(C_GROUP) | A_BOLD);
+            }
+
+            // Right label: total span duration
             char span_label[32];
             snprintf(span_label, sizeof(span_label), " %s", fmt_time_ms(span).c_str());
             mvwaddstr(w, 2, cols_ - (int)strlen(span_label), span_label);
@@ -1399,7 +1516,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  a:age  /:search  m:mark  W:export  Z:timeline  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src%s",
+                  " q:quit  f:filter  a:age  /:search  m:mark  M:marker  D:del-marker  [/]:range  R:clr-range  W:export  Z:timeline  t/T:thread  s/S:sort  Tab/h/l:pane  j/k:nav  L:src%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1930,13 +2047,17 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.delta_mode = false;
                 ui.mark_ts    = 0;
             } else {
-                // Set mark at the latest timestamp across all records
-                uint64_t max_ts = 0;
-                for (const auto& r : ui.ps->records) {
-                    max_ts = max(max_ts, r.timestamp_us);
-                    if (r.freed) max_ts = max(max_ts, r.free_timestamp_us);
+                // Mark at selected record's timestamp; fall back to max_ts if nothing selected
+                uint64_t ts = 0;
+                if (ui.has_selection()) {
+                    ts = ui.selected_ts();
+                } else {
+                    for (const auto& r : ui.ps->records) {
+                        ts = max(ts, r.timestamp_us);
+                        if (r.freed) ts = max(ts, r.free_timestamp_us);
+                    }
                 }
-                ui.mark_ts   = max_ts;
+                ui.mark_ts    = ts;
                 ui.delta_mode = true;
             }
             ui.rebuild();
@@ -1969,6 +2090,67 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         if (ch == 'Z') {
             ui.show_timeline = !ui.show_timeline;
             rebuild_windows();
+            goto next_draw;
+        }
+
+        // ── Persistent markers & range diff ──────────────────────────────
+
+        // M: add marker at selected record's timestamp
+        if (ch == 'M') {
+            if (ui.has_selection()) {
+                uint64_t ts = ui.selected_ts();
+                int id = ui.add_marker(ts);
+                if (id > 0)
+                    redraw_with_msg("Marker M" + std::to_string(id) + " added at " + fmt_time_ms(ts));
+                else
+                    redraw_with_msg("Max 9 markers reached — press D to remove one");
+            } else {
+                redraw_with_msg("No record selected");
+            }
+            goto next_draw;
+        }
+
+        // D: delete nearest marker to selected record
+        if (ch == 'D') {
+            uint64_t ts = ui.selected_ts();
+            if (!ui.markers.empty()) {
+                ui.remove_nearest_marker(ts > 0 ? ts : ui.markers[0].ts);
+                redraw_with_msg("Marker removed (" + std::to_string(ui.markers.size()) + " remaining)");
+            }
+            goto next_draw;
+        }
+
+        // [: set range start (snap to nearest marker ≤ selected ts, or selected ts)
+        if (ch == '[') {
+            if (ui.has_selection()) {
+                ui.range_start = ui.snap_left(ui.selected_ts());
+                if (ui.range_active && ui.range_end < ui.range_start)
+                    ui.range_end = ui.range_start;
+                ui.range_active = (ui.range_end > ui.range_start);
+                ui.rebuild();
+                redraw_with_msg("Range start: " + fmt_time_ms(ui.range_start));
+            }
+            goto next_draw;
+        }
+
+        if (ch == ']') {
+            if (ui.has_selection()) {
+                ui.range_end = ui.snap_right(ui.selected_ts());
+                if (ui.range_end < ui.range_start) ui.range_start = ui.range_end;
+                ui.range_active = (ui.range_end > ui.range_start);
+                ui.rebuild();
+                redraw_with_msg("Range end: " + fmt_time_ms(ui.range_end));
+            }
+            goto next_draw;
+        }
+
+        // R: clear range filter (keeps markers)
+        if (ch == 'R') {
+            ui.range_active = false;
+            ui.range_start  = 0;
+            ui.range_end    = 0;
+            ui.rebuild();
+            redraw_with_msg("Range cleared");
             goto next_draw;
         }
 
