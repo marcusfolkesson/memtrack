@@ -1306,7 +1306,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  a:age  /:search  m:mark/delta  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
+                  " q:quit  f:filter  a:age  /:search  m:mark  W:export  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1504,6 +1504,70 @@ static void free_windows(Windows& w)
     delwin(w.detail); delwin(w.threads); delwin(w.status);
 }
 
+// ─── Export to text file ─────────────────────────────────────────────────────
+static bool export_to_file(const string& path, const UI& ui, const string& source)
+{
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return false;
+
+    // Header
+    fprintf(f, "memtrack export — %s\n", source.c_str());
+    fprintf(f, "Filter: %s  |  Thread: %s  |  Sort: %s%s",
+            filter_label[ui.filter],
+            ui.tid_filter == -1 ? "all" : [&]() -> string {
+                for (auto& t : ui.ps->threads)
+                    if (t.tid == ui.tid_filter) return t.name;
+                return "?";
+            }().c_str(),
+            sort_label[ui.sort],
+            ui.sort_rev ? " ▲" : " ▼");
+    if (!ui.search_str.empty()) fprintf(f, "  |  Search: %s", ui.search_str.c_str());
+    if (ui.lifetime_min_us > 0) fprintf(f, "  |  Age≥%s", fmt_time_ms(ui.lifetime_min_us).c_str());
+    if (ui.delta_mode)          fprintf(f, "  |  DELTA since %s", fmt_time_ms(ui.mark_ts).c_str());
+    fprintf(f, "\n");
+    fprintf(f, "Records shown: %zu\n", ui.group_mode ? ui.groups.size() : ui.visible.size());
+    fprintf(f, "%s\n", string(80, '-').c_str());
+
+    if (ui.group_mode) {
+        // Grouped export
+        fprintf(f, "%-8s  %-12s  %s\n", "Count", "Total", "Call site");
+        fprintf(f, "%s\n", string(80, '-').c_str());
+        for (const auto& g : ui.groups) {
+            string desc = g.frames.empty() ? g.op : demangle_frame(g.frames[0]);
+            string tinfo = g.tid != -1 ? ("  [" + g.thread_name + "]") : "  [multiple threads]";
+            fprintf(f, "×%-7zu  %-12s  %s%s\n",
+                    g.count, fmt_size(g.total_size).c_str(),
+                    desc.c_str(), tinfo.c_str());
+            // All frames
+            for (size_t i = 0; i < g.frames.size(); i++)
+                fprintf(f, "    #%zu  %s\n", i, demangle_frame(g.frames[i]).c_str());
+            fprintf(f, "\n");
+        }
+    } else {
+        // Per-record export
+        fprintf(f, "%-3s  %-18s  %-9s  %-12s  %-10s  %-15s\n",
+                "St.", "Pointer", "Op", "Time", "Size", "Thread");
+        fprintf(f, "%s\n", string(80, '-').c_str());
+        for (size_t vi : ui.visible) {
+            const auto& r = ui.ps->records[vi];
+            char status = r.is_leak ? 'L' : (r.freed ? 'F' : 'A');
+            char ptr_buf[24];
+            snprintf(ptr_buf, sizeof(ptr_buf), "0x%014" PRIxPTR, r.ptr);
+            fprintf(f, "[%c]  %-18s  %-9s  %-12s  %-10s  %s\n",
+                    status, ptr_buf, r.op.c_str(),
+                    fmt_time_ms(r.timestamp_us).c_str(),
+                    fmt_size(r.size).c_str(),
+                    r.thread_name.c_str());
+            for (size_t i = 0; i < r.frames.size(); i++)
+                fprintf(f, "    #%zu  %s\n", i, demangle_frame(r.frames[i]).c_str());
+            if (!r.frames.empty()) fprintf(f, "\n");
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
 // ─── Input prompt helper ─────────────────────────────────────────────────────
 // Shows a one-line prompt in the given window, reads a string from the user.
 // Returns the entered string, or "" if the user pressed Esc/Ctrl-C.
@@ -1585,6 +1649,19 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         draw_detail(win.detail, ui);
         draw_threads(win.threads, ui);
         draw_status(win.status, ui);
+    };
+
+    // Transient one-line message shown in place of status bar until next keypress.
+    string status_msg;
+
+    auto redraw_with_msg = [&](const string& msg) {
+        redraw();
+        werase(win.status);
+        wattron(win.status, COLOR_PAIR(C_ALLOC) | A_BOLD);
+        mvwprintw(win.status, 0, 0, " %s", msg.c_str());
+        wattroff(win.status, COLOR_PAIR(C_ALLOC) | A_BOLD);
+        wrefresh(win.status);
+        status_msg = msg;
     };
 
     // Helper: scroll list so `selected` is visible.
@@ -1766,6 +1843,18 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.delta_mode = true;
             }
             ui.rebuild();
+            goto next_draw;
+        }
+
+        // Export visible records to a text file
+        if (ch == 'W') {
+            string path = prompt_input(win.status, "Export to file: ");
+            if (!path.empty()) {
+                if (export_to_file(path, ui, filename))
+                    redraw_with_msg("Exported " + std::to_string(ui.group_mode ? ui.groups.size() : ui.visible.size()) + " records to " + path);
+                else
+                    redraw_with_msg("ERROR: could not write to " + path);
+            }
             goto next_draw;
         }
 
