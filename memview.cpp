@@ -12,7 +12,7 @@
  *   ↑ ↓  PgUp PgDn  Home End   Navigate allocation list
  *   Tab / ← →                  Switch focus: list ↔ detail ↔ hot-fn pane
  *   f                           Cycle filter: All → Leaks → Active → Freed
- *   t                           Cycle thread filter
+ *   t / T                       Cycle thread filter forward / backward (Thread Summary order)
  *   F                           Toggle auto-follow (live mode)
  *   q / Esc                     Quit
  */
@@ -1034,7 +1034,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 1, 0,
-                  " q:quit  f:filter  t:thread  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
+                  " q:quit  f:filter  t/T:thread(fwd/bk)  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 1, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1303,23 +1303,48 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             goto next_draw;
         }
 
-        // Thread filter — works regardless of which pane has focus.
-        if (ch == 't') {
+        // Thread filter — cycles in the same order as the Thread Summary pane
+        // (sorted by net live bytes descending).  't' = forward, 'T' = backward.
+        if (ch == 't' || ch == 'T') {
             if (!ps.threads.empty()) {
-                if (ui.tid_filter == -1) {
-                    ui.tid_filter = ps.threads[0].tid;
-                } else {
-                    bool advanced = false;
-                    for (size_t i = 0; i < ps.threads.size(); i++) {
-                        if (ps.threads[i].tid == ui.tid_filter) {
-                            ui.tid_filter = (i+1 < ps.threads.size())
-                                            ? ps.threads[i+1].tid : -1;
-                            advanced = true;
-                            break;
+                // Build sorted order identical to the Thread Summary pane.
+                vector<int> order;
+                order.reserve(ps.threads.size());
+                for (auto& t : ps.threads) order.push_back(t.tid);
+                std::stable_sort(order.begin(), order.end(),
+                    [&](int a, int b) {
+                        size_t na = 0, nb = 0;
+                        for (auto& t : ps.threads) {
+                            if (t.tid == a) na = t.net();
+                            if (t.tid == b) nb = t.net();
                         }
+                        return na > nb;
+                    });
+
+                if (ch == 't') {
+                    // Forward: all → order[0] → order[1] → … → all
+                    if (ui.tid_filter == -1) {
+                        ui.tid_filter = order[0];
+                    } else {
+                        auto it = std::find(order.begin(), order.end(), ui.tid_filter);
+                        if (it == order.end() || std::next(it) == order.end())
+                            ui.tid_filter = -1;   // wrap to "all"
+                        else
+                            ui.tid_filter = *std::next(it);
                     }
-                    if (!advanced) ui.tid_filter = -1;
+                } else {
+                    // Backward: all → order[last] → order[last-1] → … → all
+                    if (ui.tid_filter == -1) {
+                        ui.tid_filter = order.back();
+                    } else {
+                        auto it = std::find(order.begin(), order.end(), ui.tid_filter);
+                        if (it == order.end() || it == order.begin())
+                            ui.tid_filter = -1;   // wrap to "all"
+                        else
+                            ui.tid_filter = *std::prev(it);
+                    }
                 }
+
                 // Pause auto-follow so the user can browse the filtered view.
                 if (live) ui.auto_follow = false;
                 ui.rebuild();
