@@ -16,7 +16,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <execinfo.h>
-#include <cxxabi.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -108,7 +107,6 @@ static std::atomic<int> g_outfd{STDERR_FILENO};
 static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socket)
 static size_t g_min_size       = 0;
 static int    g_stack_depth    = 0;       // 0 = stack traces disabled
-static bool   g_demangle       = false;   // demangle in memtrack (default off — let memview do it)
 
 static void outfd_write(const void* buf, size_t n)
 {
@@ -262,9 +260,6 @@ static void __attribute__((constructor)) memtrack_ctor()
         long d = strtol(depth, nullptr, 10);
         g_stack_depth = (d > 0 && d <= 64) ? (int)d : 0;
     }
-
-    const char* dem = getenv("MEMTRACK_DEMANGLE");
-    if (dem) g_demangle = (dem[0] != '0' && dem[0] != '\0');
 }
 
 static inline void ensure_exit_hook()
@@ -295,23 +290,11 @@ static const char* get_thread_name()
 // Print symbolised stack frames.  Must be called with in_hook == true.
 // backtrace_symbols() allocates internally; real_free() is used to release it
 // so the freed buffer is never tracked.
-//
-// Each symbol string from backtrace_symbols looks like one of:
-//   ./binary(mangled_name+0xNN) [0xADDR]   — Linux with -rdynamic
-//   ./binary(+0xoffset) [0xADDR]            — no symbol
-//   /lib/libc.so.6(func+0xNN) [0xADDR]
-//
-// We extract the mangled name (between '(' and '+'/')'), demangle it with
-// __cxa_demangle, and reconstruct the string.
+// Symbols are emitted raw (mangled); memview demandles them on display.
 static void print_frames(void** frames, int count)
 {
-    // Save and force in_hook=true for the duration of this function.
-    // backtrace_symbols and __cxa_demangle both call malloc internally; if the
-    // caller had cleared in_hook (free path), those mallocs would be tracked
-    // but freed via real_free (untracked), creating phantom leak entries in g_map.
-    // Restoring the caller's value at the end preserves the intended behaviour:
-    // on the free path (in_hook=false at entry) we restore false, so destructor
-    // chains fired AFTER print_frames returns are still tracked correctly.
+    // Preserve in_hook across the call: backtrace_symbols calls malloc internally;
+    // forcing in_hook=true prevents those internal allocs from being tracked.
     bool saved_hook = in_hook;
     in_hook = true;
 
@@ -320,46 +303,8 @@ static void print_frames(void** frames, int count)
 
     char buf[1024];
     for (int i = 0; i < count; i++) {
-        const char* sym = syms[i];
-
-        // Locate the mangled symbol between '(' and the first '+' or ')'
-        const char* lparen = strchr(sym, '(');
-        const char* plus   = lparen ? strpbrk(lparen, "+)") : nullptr;
-
-        if (lparen && plus && plus > lparen + 1) {
-            // Extract module (everything before '(')
-            int mod_len = (int)(lparen - sym);
-
-            // Extract mangled name
-            int  name_len  = (int)(plus - lparen - 1);
-            char mangled[512];
-            if (name_len >= (int)sizeof(mangled)) name_len = (int)sizeof(mangled) - 1;
-            memcpy(mangled, lparen + 1, (size_t)name_len);
-            mangled[name_len] = '\0';
-
-            // Remainder: "+0xNN) [0xADDR]"
-            const char* rest = plus;
-
-            int n;
-            if (g_demangle) {
-                // Demangle — __cxa_demangle allocates with malloc; release with real_free
-                int   status    = -1;
-                char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
-                const char* display = (status == 0 && demangled) ? demangled : mangled;
-                n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
-                             i, mod_len, sym, display, rest);
-                if (demangled) { if (real_free) real_free(demangled); else free(demangled); }
-            } else {
-                // Emit raw — memview (or the caller) will demangle on display
-                n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
-                             i, mod_len, sym, mangled, rest);
-            }
-            if (n > 0) outfd_write(buf, (size_t)n);
-        } else {
-            // Fallback: print as-is
-            int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, sym);
-            if (n > 0) outfd_write(buf, (size_t)n);
-        }
+        int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, syms[i]);
+        if (n > 0) outfd_write(buf, (size_t)n);
     }
     if (real_free) real_free(syms); else free(syms);
     in_hook = saved_hook;

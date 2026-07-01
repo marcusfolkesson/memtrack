@@ -39,8 +39,8 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_PORT`        | _(none)_      | Start a TCP server on this port. The application **pauses at startup** until a client connects (e.g., `memview :PORT`). Output goes to the connected client instead of a file. Takes priority over `MEMTRACK_OUTPUT`. |
 | `MEMTRACK_OUTPUT`      | _(stderr)_    | Write all output to this file instead of stderr. Created/truncated at startup. |
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
-| `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
-| `MEMTRACK_DEMANGLE`    | `0`           | Set to `1` to demangle C++ symbols in memtrack's log output. By default symbols are left mangled and `memview` demandles them on display. |
+| `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. Symbols are emitted raw (mangled); `memview` demandles them on display. |
+
 
 ### TCP server mode
 
@@ -306,7 +306,7 @@ memtrack is a debugging tool; its overhead is significant and it is **not intend
 | `clock_gettime(CLOCK_MONOTONIC)` | Medium | One syscall per event for the timestamp |
 | `syscall(SYS_gettid)` | Medium | Called on every allocation (not cached) |
 | `backtrace()` | **Very high** (if enabled) | 10–100 µs per call depending on stack depth; disabled by default |
-| `backtrace_symbols()` + `__cxa_demangle` | **Very high** (if enabled) | Demangling is especially expensive; only called when printing |
+| `backtrace_symbols()` | **Very high** (if enabled) | Demangling is done in memview, not memtrack |
 
 **Typical slowdown** (stack traces off): **1.5–3×** — two `write()` syscalls and two `clock_gettime` calls per alloc/free pair. The free hook is completely lock-free: it does one `clock_gettime`, one `snprintf` into a stack buffer, and one `write()`.
 
@@ -332,7 +332,7 @@ With `MEMTRACK_STACK_DEPTH=5` the slowdown can reach **50–100×**.
 
 - **Timestamps** — `clock_gettime(CLOCK_MONOTONIC)` is captured in `memtrack_ctor()` as the zero point. Each event records microseconds elapsed since that point. Allocations before the constructor fires (early runtime init) are recorded with `ts=0`.
 
-- **Stack traces & demangling** — `backtrace()` is called skipping two internal frames (the hook + `log_alloc`/`log_free`) so `#0` is always user code. By default memtrack emits raw mangled names; memview demandles on display using `abi::__cxa_demangle`. Set `MEMTRACK_DEMANGLE=1` to demangle in the log instead.
+- **Stack traces & demangling** — `backtrace()` is called skipping two internal frames (the hook + `log_alloc`/`log_free`) so `#0` is always user code. Symbols are emitted raw (mangled); memview demandles them on display using `abi::__cxa_demangle`.
 
 - **`write()` for output** — uses the `write(2)` syscall directly instead of `printf`/`fprintf` to avoid stdio buffering and re-entrant allocation inside the hook.
 
