@@ -175,6 +175,12 @@ static void parse_line(const char* line, ParseState& st)
         sscanf(after, "%*s ts=%llu size=%zu total=%zu ptr=%p", &ts_ull, &sz, &total, &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
+        // ptr=0 means sscanf failed to parse the pointer field — the line was
+        // truncated or two events were concatenated (old newline bug in memtrack).
+        // memtrack never logs a successful alloc with a null return value,
+        // so discard this record rather than inserting a bogus ptr=0 entry.
+        if (ptr == 0) return;
+
         // Register thread and track bytes allocated.
         st.thread(tid, tname).allocated += sz;
 
@@ -188,6 +194,23 @@ static void parse_line(const char* line, ParseState& st)
         rec.timestamp_us = (uint64_t)ts_ull;
 
         size_t idx = st.records.size();
+
+        // If this pointer is already tracked as live, a matching free was written
+        // out-of-order in the log due to thread-local buffer flushing (the free
+        // happened chronologically before this alloc but its write was delayed).
+        // The allocator guarantees the same address cannot be live-allocated
+        // twice, so silently retire the old record as freed-by-reuse.
+        auto existing = st.ptr_idx.find(ptr);
+        if (existing != st.ptr_idx.end()) {
+            auto& old_rec = st.records[existing->second];
+            if (!old_rec.freed) {
+                old_rec.freed = true;
+                // Don't penalise the thread's freed counter — the real free
+                // event will arrive later and would double-credit otherwise.
+                // Just ensure the record isn't flagged as a leak.
+            }
+        }
+
         st.ptr_idx[ptr] = idx;
         st.records.push_back(std::move(rec));
         st.last     = ParseState::Last::ALLOC;
