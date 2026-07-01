@@ -96,7 +96,6 @@ static __thread bool   name_cached  = false;          // separate from thread_na
 static __thread char   thread_name[16] = {};          // max 15 chars + NUL
 
 static const char* get_thread_name();  // forward declaration
-static void print_frames(void**, int); // forward declaration
 static void log_free(void*, const char*); // forward declaration
 
 // ---------------------------------------------------------------------------
@@ -287,44 +286,39 @@ static const char* get_thread_name()
     return thread_name;
 }
 
-// Print symbolised stack frames.  Must be called with in_hook == true.
-// backtrace_symbols() allocates internally; real_free() is used to release it
-// so the freed buffer is never tracked.
-// Symbols are emitted raw (mangled); memview demandles them on display.
-static void print_frames(void** frames, int count)
+// Append symbolised stack frames into buf[off..bufsize).
+// Returns the new offset (bytes written so far).  Must be called with in_hook==true.
+static int append_frames(char* buf, int off, int bufsize, void** frames, int count)
 {
-    // Preserve in_hook across the call: backtrace_symbols calls malloc internally;
-    // forcing in_hook=true prevents those internal allocs from being tracked.
-    bool saved_hook = in_hook;
-    in_hook = true;
-
+    // backtrace_symbols calls malloc internally; in_hook must stay true.
     char** syms = backtrace_symbols(frames, count);
-    if (!syms) { in_hook = saved_hook; return; }
-
-    char buf[1024];
-    for (int i = 0; i < count; i++) {
-        int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, syms[i]);
-        if (n > 0) outfd_write(buf, (size_t)n);
+    if (!syms) return off;
+    for (int i = 0; i < count && off < bufsize - 1; i++) {
+        int n = snprintf(buf + off, (size_t)(bufsize - off),
+                         "[memtrack]   #%-2d %s\n", i, syms[i]);
+        if (n > 0) off += (n < bufsize - off) ? n : bufsize - off - 1;
     }
     if (real_free) real_free(syms); else free(syms);
-    in_hook = saved_hook;
+    return off;
 }
 
 static void log_alloc(const char* op, size_t size, void* ptr)
 {
     ensure_exit_hook();
-    // Only credit thread_total for successful allocations.
     if (ptr) thread_total += size;
 
     if (!ptr || size < g_min_size) return;
 
     uint64_t ts = elapsed_us();
 
-    // Skip 2 frames: log_alloc itself + the hook (malloc/new/etc.).
-    // cpp_alloc/cpp_free are always_inline so they don't add a frame.
+    // Capture frames before writing anything so the entire event is assembled
+    // into one buffer and written with a single write() — this prevents
+    // interleaving with concurrent threads.
     void* frames[32];
     int   frame_count = 0;
     if (g_stack_depth > 0) {
+        // Skip 2: log_alloc + the hook (malloc/calloc/new/etc.).
+        // cpp_alloc is always_inline so it adds no frame.
         const int skip  = 2;
         const int total = g_stack_depth + skip;
         int raw = backtrace(frames, total < 32 ? total : 32);
@@ -332,57 +326,57 @@ static void log_alloc(const char* op, size_t size, void* ptr)
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    char buf[384];
-    int n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  total=%-12zu  ptr=%p\n",
-                     get_tid(), get_thread_name(), op,
-                     (unsigned long long)ts, size, thread_total, ptr);
-    if (n > 0)
-        outfd_write(buf, (size_t)n);
-
-    if (frame_count > 0)
-        print_frames(frames, frame_count);
+    char buf[4096];
+    int off = snprintf(buf, sizeof(buf),
+                       "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  total=%-12zu  ptr=%p\n",
+                       get_tid(), get_thread_name(), op,
+                       (unsigned long long)ts, size, thread_total, ptr);
+    if (off > 0 && frame_count > 0)
+        off = append_frames(buf, off, (int)sizeof(buf), frames, frame_count);
+    if (off > 0) outfd_write(buf, (size_t)off);
 }
 
-// Log a free/delete event and capture the stack frames.
-// On return, in_hook is TRUE and the caller must: call real_free, clear
-// in_hook, and optionally call print_frames if frame_count > 0.
+// Log a free/delete event + optional frames in a single write().
+// skip: frames to discard so #0 lands on user code.
+//   2 = called directly from free hook or cpp_free (always_inline)
+//   3 = called via log_free wrapper (one extra non-inlined frame for realloc)
+// On return, in_hook is TRUE; the caller must call real_free then clear in_hook.
 static bool log_free_capture(void* ptr, const char* op,
-                              void** frames, int& frame_count)
+                              int skip = 2)
 {
-    frame_count = 0;
     if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return false;
 
     in_hook = true;
 
     uint64_t ts = elapsed_us();
 
+    void* frames[32];
+    int   frame_count = 0;
     if (g_stack_depth > 0) {
-        const int skip  = 2;
         const int total = g_stack_depth + skip;
         int raw = backtrace(frames, total < 32 ? total : 32);
         frame_count = (raw > skip) ? raw - skip : 0;
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf),
-                     "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu  ptr=%p\n",
-                     get_tid(), get_thread_name(), op, (unsigned long long)ts, ptr);
-    if (n > 0) outfd_write(buf, (size_t)n);
+    char buf[4096];
+    int off = snprintf(buf, sizeof(buf),
+                       "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu  ptr=%p\n",
+                       get_tid(), get_thread_name(), op, (unsigned long long)ts, ptr);
+    if (off > 0 && frame_count > 0)
+        off = append_frames(buf, off, (int)sizeof(buf), frames, frame_count);
+    if (off > 0) outfd_write(buf, (size_t)off);
 
     return true;
 }
 
-// log_free: convenience wrapper for realloc (logs a synthetic free without
-// calling real_free — realloc does that itself via real_realloc).
+// log_free: convenience wrapper for realloc — logs a synthetic free without
+// calling real_free (realloc does that itself via real_realloc).
+// Uses skip=3: log_free_capture + log_free + realloc are all on the stack.
 static void log_free(void* ptr, const char* op)
 {
-    void* frames[32];
-    int   frame_count = 0;
-    if (!log_free_capture(ptr, op, frames, frame_count)) return;
+    if (!log_free_capture(ptr, op, 3)) return;
     in_hook = false;
-    if (frame_count > 0) print_frames(frames, frame_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,14 +466,9 @@ void free(void* ptr)
     if (!ptr || is_bootstrap_ptr(ptr)) return;
     if (!real_free) resolve();
 
-    void* frames[32];
-    int   frame_count = 0;
-    bool  tracked = log_free_capture(ptr, "free", frames, frame_count);
-
+    bool tracked = log_free_capture(ptr, "free");
     real_free(ptr);
     if (tracked) in_hook = false;
-    if (tracked && frame_count > 0)
-        print_frames(frames, frame_count);
 }
 
 } // extern "C"
@@ -516,18 +505,9 @@ static inline void cpp_free(void* p, const char* op) noexcept
 {
     if (!p || is_bootstrap_ptr(p) || !real_free) return;
 
-    void* frames[32];
-    int   frame_count = 0;
-    bool  tracked = log_free_capture(p, op, frames, frame_count);
-
+    bool tracked = log_free_capture(p, op);
     real_free(p);
-
-    // Clear in_hook AFTER real_free so reentrant free(p) during print_frames
-    // sees in_hook=true and exits early (double-free guard).
     if (tracked) in_hook = false;
-
-    if (tracked && frame_count > 0)
-        print_frames(frames, frame_count);
 }
 
 void* operator new  (size_t s)            { return cpp_alloc(s, "new");   }
