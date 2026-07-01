@@ -172,11 +172,12 @@ static void parse_line(const char* line, ParseState& st)
 
     // ── LEAK (from exit report) ───────────────────────────────────────────
     if (!strcmp(op, "LEAK")) {
-        char   lop[32] = {};
-        size_t sz      = 0;
-        void*  ptr_raw = nullptr;
-        unsigned long long ts_ull = 0;
-        sscanf(after, "LEAK ts=%llu %31s size=%zu ptr=%p", &ts_ull, lop, &sz, &ptr_raw);
+        void* ptr_raw = nullptr;
+        // Full format:    "LEAK ts=<ts> <op> size=<sz> ptr=<ptr>"
+        // Compact format: "LEAK size=<sz> ptr=<ptr>"
+        // Extract ptr= regardless of which format is present.
+        const char* pptr = strstr(after, "ptr=");
+        if (pptr) sscanf(pptr, "ptr=%p", &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
         auto it = st.ptr_idx.find(ptr);
         if (it != st.ptr_idx.end()) {

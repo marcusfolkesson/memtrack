@@ -41,6 +41,7 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
 | `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
 | `MEMTRACK_DEMANGLE`    | `0`           | Set to `1` to demangle C++ symbols in memtrack's log output. By default symbols are left mangled and `memview` demangled them on display. |
+| `MEMTRACK_COMPACT`     | `1`           | When `1` (default), store only `tid`, `name`, and `size` per live allocation (~28 bytes) instead of the full record including stack frames (~308 bytes). Compact mode reduces per-allocation overhead by ~11×. Set to `0` for standalone log analysis without memview (LEAK lines will include op, timestamp, and reprinted stack frames). |
 
 ### TCP server mode
 
