@@ -105,10 +105,15 @@ static void log_free(void*, const char*); // forward declaration
 // Output fd and size filter  (MEMTRACK_OUTPUT / MEMTRACK_MIN_SIZE env vars)
 // Defined here so thread_exit_handler (below) can reference them.
 // ---------------------------------------------------------------------------
-static int    g_outfd          = STDERR_FILENO;
+static std::atomic<int> g_outfd{STDERR_FILENO};
 static bool   g_close_outfd   = false;   // true when we own g_outfd (file/socket)
 static size_t g_min_size       = 0;
 static int    g_stack_depth    = 0;   // 0 = stack traces disabled
+
+static void outfd_write(const void* buf, size_t n)
+{
+    if (n > 0) write(g_outfd.load(std::memory_order_relaxed), buf, n);
+}
 
 // Monotonic start time – set in memtrack_ctor(); elapsed_us() returns
 // microseconds since then (0 for any allocation before the ctor runs).
@@ -203,7 +208,7 @@ static void thread_exit_handler(void*)
     n = snprintf(buf, sizeof(buf),
                  "[memtrack] tid=%-6d (%-15s) EXIT       ts=%-12llu total=%-12zu bytes allocated\n",
                  tid, get_thread_name(), (unsigned long long)elapsed_us(), thread_total);
-    if (n > 0) write(g_outfd, buf, (size_t)n);
+    if (n > 0) outfd_write(buf, (size_t)n);
 
     // Set in_hook so that g_map->erase() below does not try to re-enter the map.
     in_hook = true;
@@ -222,7 +227,7 @@ static void thread_exit_handler(void*)
                          "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
                          tid, get_thread_name(), (unsigned long long)info.timestamp_us,
                          info.op, info.size, ptr);
-            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (n > 0) outfd_write(buf, (size_t)n);
             if (info.frame_count > 0)
                 print_frames(info.frames, info.frame_count);
         }
@@ -242,7 +247,7 @@ static void thread_exit_handler(void*)
                          "[memtrack] tid=%-6d (%-15s) SUMMARY    all allocations freed\n",
                          tid, get_thread_name());
         }
-        if (n > 0) write(g_outfd, buf, (size_t)n);
+        if (n > 0) outfd_write(buf, (size_t)n);
     }
 
     pthread_mutex_unlock(&g_lock);
@@ -303,7 +308,7 @@ static void atexit_handler()
                          tid, info.name,
                          (unsigned long long)info.timestamp_us,
                          info.op, info.size, (void*)ptr);
-            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (n > 0) outfd_write(buf, (size_t)n);
             if (info.frame_count > 0)
                 print_frames(info.frames, info.frame_count);
         }
@@ -313,7 +318,7 @@ static void atexit_handler()
                          "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
                          tid, tname ? tname : "?",
                          leak_count, leak_bytes);
-            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (n > 0) outfd_write(buf, (size_t)n);
         }
     }
 
@@ -325,14 +330,20 @@ static void atexit_handler()
     // than close() so that threads still running don't write to a recycled fd.
     // For plain files close() is safe here since we're in the atexit handler
     // and the process is single-threaded at this point in practice.
-    if (g_close_outfd && g_outfd != STDERR_FILENO) {
-        // Determine if g_outfd is a socket by probing getsockopt
-        int type = 0; socklen_t tlen = sizeof(type);
-        if (getsockopt(g_outfd, SOL_SOCKET, SO_TYPE, &type, &tlen) == 0)
-            shutdown(g_outfd, SHUT_WR);   // TCP: signal EOF, don't invalidate fd
-        else
-            close(g_outfd);
-        g_outfd = STDERR_FILENO;
+    if (g_close_outfd) {
+        // Atomically redirect writers to stderr before closing the fd.
+        // Any write() that loaded the old fd *before* this swap will go to a
+        // closed (or recycled) fd — that's an unavoidable TOCTOU given that
+        // we can't quiesce all threads here.  Writers that load *after* the swap
+        // go safely to stderr.
+        int old_fd = g_outfd.exchange(STDERR_FILENO, std::memory_order_acq_rel);
+        if (old_fd != STDERR_FILENO) {
+            int type = 0; socklen_t tlen = sizeof(type);
+            if (getsockopt(old_fd, SOL_SOCKET, SO_TYPE, &type, &tlen) == 0)
+                shutdown(old_fd, SHUT_WR);
+            else
+                close(old_fd);
+        }
     }
 }
 
@@ -378,7 +389,7 @@ static void __attribute__((constructor)) memtrack_ctor()
                     unsetenv("MEMTRACK_PORT");
                     close(srv);
                     if (client >= 0) {
-                        g_outfd        = client;
+                        g_outfd.store(client, std::memory_order_relaxed);
                         g_close_outfd  = true;
                         n = snprintf(msg, sizeof(msg),
                                      "[memtrack] client connected, starting application\n");
@@ -401,7 +412,7 @@ static void __attribute__((constructor)) memtrack_ctor()
         if (out) {
             int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
             if (fd >= 0) {
-                g_outfd       = fd;
+                g_outfd.store(fd, std::memory_order_relaxed);
                 g_close_outfd = true;
                 // Prevent child processes from reopening and truncating the file.
                 unsetenv("MEMTRACK_OUTPUT");
@@ -461,8 +472,18 @@ static const char* get_thread_name()
 // __cxa_demangle, and reconstruct the string.
 static void print_frames(void** frames, int count)
 {
+    // Save and force in_hook=true for the duration of this function.
+    // backtrace_symbols and __cxa_demangle both call malloc internally; if the
+    // caller had cleared in_hook (free path), those mallocs would be tracked
+    // but freed via real_free (untracked), creating phantom leak entries in g_map.
+    // Restoring the caller's value at the end preserves the intended behaviour:
+    // on the free path (in_hook=false at entry) we restore false, so destructor
+    // chains fired AFTER print_frames returns are still tracked correctly.
+    bool saved_hook = in_hook;
+    in_hook = true;
+
     char** syms = backtrace_symbols(frames, count);
-    if (!syms) return;
+    if (!syms) { in_hook = saved_hook; return; }
 
     char buf[1024];
     for (int i = 0; i < count; i++) {
@@ -493,15 +514,16 @@ static void print_frames(void** frames, int count)
 
             int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %.*s(%s%s\n",
                              i, mod_len, sym, display, rest);
-            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (n > 0) outfd_write(buf, (size_t)n);
             if (demangled) { if (real_free) real_free(demangled); else free(demangled); }
         } else {
             // Fallback: print as-is
             int n = snprintf(buf, sizeof(buf), "[memtrack]   #%-2d %s\n", i, sym);
-            if (n > 0) write(g_outfd, buf, (size_t)n);
+            if (n > 0) outfd_write(buf, (size_t)n);
         }
     }
     if (real_free) real_free(syms); else free(syms);
+    in_hook = saved_hook;
 }
 
 static void log_alloc(const char* op, size_t size, void* ptr)
@@ -534,24 +556,27 @@ static void log_alloc(const char* op, size_t size, void* ptr)
                      get_tid(), get_thread_name(), op,
                      (unsigned long long)ts, size, thread_total, ptr);
     if (n > 0)
-        write(g_outfd, buf, (size_t)n);
+        outfd_write(buf, (size_t)n);
 
     if (frame_count > 0)
         print_frames(frames, frame_count);
 }
 
-// Log a free/delete.  Only logs if the pointer is tracked in g_map (meaning
-// the allocation passed the size filter); untracked pointers are silently ignored.
-static void log_free(void* ptr, const char* op)
+// Log a free/delete event and capture the stack frames.
+// On return, in_hook is TRUE if the pointer was tracked; the caller is then
+// responsible for: erasing from g_map, calling real_free, clearing in_hook,
+// and finally calling print_frames.
+// Returns true if tracked (caller must handle the cleanup), false otherwise.
+static bool log_free_capture(void* ptr, const char* op,
+                              void** frames, int& frame_count)
 {
-    if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
+    frame_count = 0;
+    if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return false;
 
     in_hook = true;
 
     uint64_t ts = elapsed_us();
 
-    void* frames[32];
-    int   frame_count = 0;
     if (g_stack_depth > 0) {
         const int skip  = 2;
         const int total = g_stack_depth + skip;
@@ -560,8 +585,6 @@ static void log_free(void* ptr, const char* op)
         for (int i = 0; i < frame_count; i++) frames[i] = frames[i + skip];
     }
 
-    // Look up the allocation size.  If the pointer is not in the map it was
-    // either filtered out at allocation time or allocated before memtrack loaded.
     size_t size    = 0;
     bool   tracked = false;
     pthread_mutex_lock(&g_lock);
@@ -573,7 +596,7 @@ static void log_free(void* ptr, const char* op)
 
     if (!tracked) {
         in_hook = false;
-        return;
+        return false;
     }
 
     char buf[384];
@@ -581,12 +604,28 @@ static void log_free(void* ptr, const char* op)
                      "[memtrack] tid=%-6d (%-15s) %-10s ts=%-12llu size=%-12zu  ptr=%p\n",
                      get_tid(), get_thread_name(), op,
                      (unsigned long long)ts, size, ptr);
-    if (n > 0) write(g_outfd, buf, (size_t)n);
+    if (n > 0) outfd_write(buf, (size_t)n);
 
-    if (frame_count > 0)
-        print_frames(frames, frame_count);
+    // in_hook remains TRUE on return.  Caller must:
+    //   1. erase ptr from g_map (under g_lock)
+    //   2. call real_free(ptr)
+    //   3. set in_hook = false
+    //   4. call print_frames if frame_count > 0
+    return true;
+}
 
+// log_free: full log+print in one call.  Used by the realloc hook which
+// logs a synthetic free of old_ptr without calling real_free itself.
+static void log_free(void* ptr, const char* op)
+{
+    void* frames[32];
+    int   frame_count = 0;
+    if (!log_free_capture(ptr, op, frames, frame_count)) return;
+    // in_hook is true here; realloc owns the actual freeing, so just clear
+    // and print.  The window is small because real_realloc is called
+    // immediately after under its own in_hook=true block.
     in_hook = false;
+    if (frame_count > 0) print_frames(frames, frame_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -650,9 +689,6 @@ void* realloc(void* old_ptr, size_t size)
         return nullptr;
     }
 
-    // Log the free event first (captures stack, checks map, writes log).
-    log_free(old_ptr, "free");   // sets in_hook=false on return
-
     // Log the implicit free of old_ptr before we erase it from the map.
     // This ensures the log has a matching free entry even when real_realloc
     // returns the same address (in-place growth), preventing memview from
@@ -685,9 +721,20 @@ void free(void* ptr)
 {
     if (!ptr || is_bootstrap_ptr(ptr)) return;
     if (!real_free) resolve();
-    log_free(ptr, "free");
-    map_remove(ptr);
+
+    void* frames[32];
+    int   frame_count = 0;
+    bool  tracked = log_free_capture(ptr, "free", frames, frame_count);
+
+    if (tracked) {
+        pthread_mutex_lock(&g_lock);
+        if (g_map) g_map->erase(ptr);
+        pthread_mutex_unlock(&g_lock);
+    }
     real_free(ptr);
+    if (tracked) in_hook = false;
+    if (tracked && frame_count > 0)
+        print_frames(frames, frame_count);
 }
 
 } // extern "C"
@@ -723,9 +770,29 @@ __attribute__((always_inline))
 static inline void cpp_free(void* p, const char* op) noexcept
 {
     if (!p || is_bootstrap_ptr(p) || !real_free) return;
-    log_free(p, op);
-    map_remove(p);
+
+    void* frames[32];
+    int   frame_count = 0;
+    bool  tracked = log_free_capture(p, op, frames, frame_count);
+    // If tracked, in_hook is now TRUE — we own the cleanup.
+
+    // Erase from g_map and physically free while in_hook=true.
+    // Any reentrant free(p) during this window sees in_hook=true and exits
+    // early, so real_free cannot be called twice.
+    if (tracked) {
+        pthread_mutex_lock(&g_lock);
+        if (g_map) g_map->erase(p);
+        pthread_mutex_unlock(&g_lock);
+    }
     real_free(p);
+
+    // Clear in_hook AFTER real_free: ptr is now gone from both g_map and
+    // the heap.  If a destructor chain during print_frames tries to free p
+    // again, log_free_capture won't find it in g_map → silent no-op.
+    if (tracked) in_hook = false;
+
+    if (tracked && frame_count > 0)
+        print_frames(frames, frame_count);
 }
 
 void* operator new  (size_t s)            { return cpp_alloc(s, "new");   }
