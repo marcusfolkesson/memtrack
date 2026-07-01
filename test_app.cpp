@@ -29,7 +29,7 @@
 // ─── tiny test framework ────────────────────────────────────────────────────
 static int g_pass = 0, g_fail = 0;
 
-static void hdr(int n, const char* name)
+void hdr(int n, const char* name)
 {
     printf("\n");
     printf("┌─────────────────────────────────────────────────────────────┐\n");
@@ -37,7 +37,7 @@ static void hdr(int n, const char* name)
     printf("└─────────────────────────────────────────────────────────────┘\n");
 }
 
-static void check(bool ok, const char* msg)
+void check(bool ok, const char* msg)
 {
     if (ok) { printf("  ✓  %s\n", msg); ++g_pass; }
     else    { printf("  ✗  %s\n", msg); ++g_fail; }
@@ -47,7 +47,7 @@ static void check(bool ok, const char* msg)
 // allocations, making it trivial to correlate.  We use a 1-byte malloc that
 // is immediately freed so no tracking side-effect is left behind.
 __attribute__((noinline))
-static void log_marker(const char* label)
+void log_marker(const char* label)
 {
     printf("  → LOG MARKER: look for allocations after this line in mt.log\n");
     printf("  → LABEL: %s\n", label);
@@ -55,7 +55,7 @@ static void log_marker(const char* label)
     void* m = malloc(1); free(m);
 }
 
-static void expect(const char* fmt, ...)
+void expect(const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -67,7 +67,7 @@ static void expect(const char* fmt, ...)
 
 // ─── TEST 01: malloc / free ──────────────────────────────────────────────────
 __attribute__((noinline))
-static void test01_malloc_free()
+void test01_malloc_free()
 {
     hdr(1, "malloc / free — zero leaks");
     expect("1× malloc(1001) then free(1001), no LEAK");
@@ -83,7 +83,7 @@ static void test01_malloc_free()
 
 // ─── TEST 02: calloc / free ──────────────────────────────────────────────────
 __attribute__((noinline))
-static void test02_calloc_free()
+void test02_calloc_free()
 {
     hdr(2, "calloc / free — zeroing + zero leaks");
     expect("1× calloc(2002) zeroed, then free(2002), no LEAK");
@@ -101,7 +101,7 @@ static void test02_calloc_free()
 struct Obj3000 { char data[3000]; };
 
 __attribute__((noinline))
-static void test03_new_delete()
+void test03_new_delete()
 {
     hdr(3, "new / delete — zero leaks");
     expect("1× new(3000) then delete(3000), no LEAK");
@@ -116,7 +116,7 @@ static void test03_new_delete()
 
 // ─── TEST 04: new[] / delete[] ───────────────────────────────────────────────
 __attribute__((noinline))
-static void test04_new_arr_delete_arr()
+void test04_new_arr_delete_arr()
 {
     hdr(4, "new[] / delete[] — zero leaks");
     expect("1× new[](4004) then delete[](4004), no LEAK");
@@ -131,7 +131,7 @@ static void test04_new_arr_delete_arr()
 
 // ─── TEST 05: realloc(NULL, size) == malloc ───────────────────────────────────
 __attribute__((noinline))
-static void test05_realloc_from_null()
+void test05_realloc_from_null()
 {
     hdr(5, "realloc(NULL, n) acts as malloc");
     expect("allocation of 5005 bytes (GCC may emit malloc@plt instead of realloc@plt)");
@@ -148,7 +148,7 @@ static void test05_realloc_from_null()
 
 // ─── TEST 06: realloc grow ───────────────────────────────────────────────────
 __attribute__((noinline))
-static void test06_realloc_grow()
+void test06_realloc_grow()
 {
     hdr(6, "realloc grow (may move) — balanced log");
     expect("malloc(6006) → free(6006) → realloc(12012) → free(12012), no LEAK");
@@ -167,7 +167,7 @@ static void test06_realloc_grow()
 
 // ─── TEST 07: realloc shrink ─────────────────────────────────────────────────
 __attribute__((noinline))
-static void test07_realloc_shrink()
+void test07_realloc_shrink()
 {
     hdr(7, "realloc shrink (likely in-place) — balanced log");
     expect("malloc(7007) → free(7007) → realloc(3500) → free(3500), no LEAK");
@@ -186,7 +186,7 @@ static void test07_realloc_shrink()
 
 // ─── TEST 08: realloc(ptr, 0) acts as free ───────────────────────────────────
 __attribute__((noinline))
-static void test08_realloc_to_zero()
+void test08_realloc_to_zero()
 {
     hdr(8, "realloc(ptr, 0) acts as free, returns NULL");
     expect("malloc(8008) → free(8008) [via realloc(ptr,0)], no LEAK");
@@ -201,7 +201,7 @@ static void test08_realloc_to_zero()
 
 // ─── TEST 09: realloc chain ───────────────────────────────────────────────────
 __attribute__((noinline))
-static void test09_realloc_chain()
+void test09_realloc_chain()
 {
     hdr(9, "realloc chain — each step logged");
     expect("malloc(100)→free+realloc(200)→free+realloc(400)→free+realloc(800)"
@@ -221,7 +221,7 @@ static void test09_realloc_chain()
 
 // ─── TEST 10: free(NULL) — silent ────────────────────────────────────────────
 __attribute__((noinline))
-static void test10_free_null()
+void test10_free_null()
 {
     hdr(10, "free(NULL) — must be silent, no log entry");
     expect("NO log entry of any kind — free(NULL) is a no-op");
@@ -236,7 +236,7 @@ static void test10_free_null()
 
 // ─── TEST 11: malloc(0) ───────────────────────────────────────────────────────
 __attribute__((noinline))
-static void test11_malloc_zero()
+void test11_malloc_zero()
 {
     hdr(11, "malloc(0) — implementation-defined, must not crash");
     expect("Either no entry (NULL return) OR malloc(0)+free(0) pair, no LEAK");
@@ -255,7 +255,7 @@ static void test11_malloc_zero()
 
 // ─── TEST 12: large allocation ────────────────────────────────────────────────
 __attribute__((noinline))
-static void test12_large_alloc()
+void test12_large_alloc()
 {
     const size_t TEN_MB = 10u * 1024u * 1024u;
     hdr(12, "large allocation (10 MB)");
@@ -273,7 +273,7 @@ static void test12_large_alloc()
 
 // ─── TEST 13: many small allocs, all freed ────────────────────────────────────
 __attribute__((noinline))
-static void test13_many_small()
+void test13_many_small()
 {
     const int N = 200;
     hdr(13, "many small allocs (200 × 13 bytes), all freed");
@@ -295,7 +295,7 @@ static void test13_many_small()
 static void* g_leak14 = nullptr;   // kept alive intentionally
 
 __attribute__((noinline))
-static void test14_intentional_leak()
+void test14_intentional_leak()
 {
     hdr(14, "intentional leak — must appear in SUMMARY");
     expect("malloc(14014) → NO free → appears as LEAK size=14014 in summary");
@@ -315,7 +315,7 @@ static sem_t  g_sem15_ready;   // thread A posts when allocation is done
 static sem_t  g_sem15_freed;   // main posts when it has freed the ptr
 
 __attribute__((noinline))
-static void* t15_alloc_thread(void*)
+void* t15_alloc_thread(void*)
 {
     pthread_setname_np(pthread_self(), "t15-alloc");
     g_cross15 = malloc(15015);
@@ -328,7 +328,7 @@ static void* t15_alloc_thread(void*)
 }
 
 __attribute__((noinline))
-static void test15_cross_thread_free()
+void test15_cross_thread_free()
 {
     hdr(15, "cross-thread free (alloc in A, free in main, A still alive)");
     expect("malloc(15015) logged under tid=A, free(15015) logged under tid=main");
@@ -363,7 +363,7 @@ static sem_t  g_sem16_allocated;
 static sem_t  g_sem16_free_done;
 
 __attribute__((noinline))
-static void* t16_leak_thread(void*)
+void* t16_leak_thread(void*)
 {
     pthread_setname_np(pthread_self(), "t16-leak");
     g_cross16 = malloc(16016);
@@ -375,7 +375,7 @@ static void* t16_leak_thread(void*)
 }
 
 __attribute__((noinline))
-static void test16_leak_cancellation()
+void test16_leak_cancellation()
 {
     hdr(16, "LEAK cancellation: A exits (LEAK logged), main frees later");
     expect("LEAK(16016) logged at thread exit, then free(16016) by main thread");
@@ -406,7 +406,7 @@ static void test16_leak_cancellation()
 struct T17Args { int id; };
 
 __attribute__((noinline))
-static void* t17_worker(void* arg)
+void* t17_worker(void* arg)
 {
     T17Args* a = (T17Args*)arg;
     char name[16];
@@ -433,7 +433,7 @@ static void* t17_worker(void* arg)
 }
 
 __attribute__((noinline))
-static void test17_multi_thread_clean()
+void test17_multi_thread_clean()
 {
     const int N = 4;
     hdr(17, "4 threads, all alloc types (malloc/calloc/new/realloc), all freed");
@@ -457,7 +457,7 @@ static void test17_multi_thread_clean()
 struct Obj18 { char data[18018]; };
 
 __attribute__((noinline))
-static void test18_sized_delete()
+void test18_sized_delete()
 {
     hdr(18, "C++14 sized delete — ::operator delete(p, n)");
     expect("new(18018) then ::operator delete(p, 18018), no LEAK");
@@ -472,7 +472,7 @@ static void test18_sized_delete()
 
 // ─── TEST 19: failed realloc — old ptr still valid ───────────────────────────
 __attribute__((noinline))
-static void test19_realloc_fail_safety()
+void test19_realloc_fail_safety()
 {
     hdr(19, "failed realloc: old ptr must remain valid and be freed");
     // Force realloc failure by requesting an absurd size.
