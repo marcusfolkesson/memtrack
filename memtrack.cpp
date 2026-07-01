@@ -71,6 +71,8 @@ static void* (*real_malloc )(size_t)        = nullptr;
 static void* (*real_calloc )(size_t,size_t) = nullptr;
 static void* (*real_realloc)(void*,size_t)  = nullptr;
 static void  (*real_free   )(void*)         = nullptr;
+static char* (*real_strdup )(const char*)   = nullptr;
+static char* (*real_strndup)(const char*, size_t) = nullptr;
 
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
 static void do_resolve()
@@ -79,6 +81,8 @@ static void do_resolve()
     real_calloc  = (void*(*)(size_t,size_t))dlsym(RTLD_NEXT, "calloc");
     real_realloc = (void*(*)(void*,size_t)) dlsym(RTLD_NEXT, "realloc");
     real_free    = (void(*)(void*))         dlsym(RTLD_NEXT, "free");
+    real_strdup  = (char*(*)(const char*))          dlsym(RTLD_NEXT, "strdup");
+    real_strndup = (char*(*)(const char*, size_t))  dlsym(RTLD_NEXT, "strndup");
 }
 static void resolve() { pthread_once(&resolve_once, do_resolve); }
 
@@ -620,6 +624,56 @@ void free(void* ptr)
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// strdup / strndup
+// ---------------------------------------------------------------------------
+// These call malloc internally, so without interception they appear as plain
+// "malloc" allocations with no useful attribution.  We override them to log
+// the op name as "strdup"/"strndup" so the call site is visible in memview.
+extern "C" {
+
+char* strdup(const char* s)
+{
+    if (!real_strdup) resolve();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
+    if (in_hook || !s) return real_strdup ? real_strdup(s) : nullptr;
+#pragma GCC diagnostic pop
+
+    size_t len = strlen(s) + 1;
+    in_hook = true;
+    // Allocate via real_malloc so free() can release it normally.
+    char* p = static_cast<char*>(real_malloc(len));
+    if (p) {
+        memcpy(p, s, len);
+        log_alloc("strdup", len, p);
+    }
+    in_hook = false;
+    return p;
+}
+
+char* strndup(const char* s, size_t n)
+{
+    if (!real_strndup) resolve();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
+    if (in_hook || !s) return real_strndup ? real_strndup(s, n) : nullptr;
+#pragma GCC diagnostic pop
+
+    size_t len = strnlen(s, n);
+    in_hook = true;
+    char* p = static_cast<char*>(real_malloc(len + 1));
+    if (p) {
+        memcpy(p, s, len);
+        p[len] = '\0';
+        log_alloc("strndup", len + 1, p);
+    }
+    in_hook = false;
+    return p;
+}
+
+} // extern "C" (strdup/strndup)
 
 // ---------------------------------------------------------------------------
 // C++ operator new / delete

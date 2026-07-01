@@ -109,7 +109,8 @@ static string rtrim(string s)
 static bool is_alloc_op(const char* op)
 {
     return !strcmp(op,"malloc") || !strcmp(op,"calloc") ||
-           !strcmp(op,"realloc") || !strcmp(op,"new") || !strcmp(op,"new[]");
+           !strcmp(op,"realloc") || !strcmp(op,"new") || !strcmp(op,"new[]") ||
+           !strcmp(op,"strdup") || !strcmp(op,"strndup");
 }
 
 static bool is_free_op(const char* op)

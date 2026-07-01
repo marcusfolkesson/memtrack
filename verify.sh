@@ -464,6 +464,27 @@ fi
 
 rm -f "$MT22_NONE" "$MT22_NONE.stdout" "$MT22_MAIN" "$MT22_MAIN.stdout"
 
+# ── T23: strdup / strndup tracked ────────────────────────────────────────────
+section "T23: strdup / strndup intercepted"
+
+# strdup: 7 bytes (strlen("hello!")+1), op=strdup, freed → no LEAK
+strdup_alloc=$(grep -cP '^\[memtrack\] tid=.*\) strdup\s.*size=7\b' "$LOG" || true)
+[[ "$strdup_alloc" -ge 1 ]] \
+    && pass "T23: strdup(7) logged with op=strdup" \
+    || fail "T23: strdup(7) not found in log"
+
+# strndup: 6 bytes (5 chars + NUL), op=strndup, freed → no LEAK
+strndup_alloc=$(grep -cP '^\[memtrack\] tid=.*\) strndup\s.*size=6\b' "$LOG" || true)
+[[ "$strndup_alloc" -ge 1 ]] \
+    && pass "T23: strndup(5+1=6) logged with op=strndup" \
+    || fail "T23: strndup(6) not found in log"
+
+# Both should be freed (no LEAK line for either)
+strdup_leak=$(grep -cP '^\[memtrack\].*LEAK.*\) strdup\b' "$LOG" || true)
+strndup_leak=$(grep -cP '^\[memtrack\].*LEAK.*\) strndup\b' "$LOG" || true)
+[[ "$strdup_leak" -eq 0 && "$strndup_leak" -eq 0 ]] \
+    && pass "T23: strdup/strndup allocations not leaked" \
+    || fail "T23: unexpected LEAK for strdup/strndup ($strdup_leak/$strndup_leak)"
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"

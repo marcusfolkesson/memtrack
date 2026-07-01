@@ -561,7 +561,27 @@ void test21_long_symbols()
     check(true, "long-symbol alloc+free completed without crash");
 }
 
-// ─── TEST 19: failed realloc — old ptr still valid ───────────────────────────
+// ─── TEST 23: strdup / strndup ───────────────────────────────────────────────
+__attribute__((noinline))
+void test23_strdup_strndup()
+{
+    hdr(23, "strdup and strndup are tracked as their own op names");
+    expect("strdup(7) logged with op=strdup, freed, no LEAK");
+    expect("strndup(5+1=6) logged with op=strndup, freed, no LEAK");
+    log_marker("T23");
+
+    char* s1 = strdup("hello!");          // 7 bytes including NUL
+    assert(s1 && strcmp(s1, "hello!") == 0);
+    free(s1);
+
+    char* s2 = strndup("world!extra", 5); // "world" + NUL = 6 bytes
+    assert(s2 && strcmp(s2, "world") == 0);
+    free(s2);
+
+    check(true, "strdup/strndup tracked and freed");
+}
+
+
 __attribute__((noinline))
 void test19_realloc_fail_safety()
 {
@@ -618,6 +638,7 @@ int main()
     test19_realloc_fail_safety();
     test20_deep_stack();
     test21_long_symbols();
+    test23_strdup_strndup();
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════\n");
