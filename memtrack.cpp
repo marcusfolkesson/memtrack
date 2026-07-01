@@ -28,6 +28,7 @@
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <atomic>
 #include <cstdlib>
 
@@ -152,30 +153,56 @@ struct AllocInfo {
     void*    frames[32];    // raw PCs captured at allocation time
 };
 
-static std::unordered_map<void*, AllocInfo>*  g_map            = nullptr;
-// Pointers reported as LEAK at thread-exit that haven't been freed yet.
-// If thread B later frees one of these, we log the free and remove it here
-// so memview can cancel the false-positive leak entry.
-static std::unordered_map<void*, size_t>*     g_reported_leaks = nullptr;
-static pthread_mutex_t                         g_lock           = PTHREAD_MUTEX_INITIALIZER;
+// ---------------------------------------------------------------------------
+// Sharded allocation map
+//
+// 16 shards keyed by (uintptr_t(ptr) >> 4) & 15.  Each shard has its own
+// mutex, reducing lock contention by ~16× compared to a single global lock.
+// Cross-thread frees are transparent: alloc and free for the same pointer
+// always hash to the same shard.
+// g_reported_leaks lives inside each shard alongside the allocation map so
+// the two structures are always protected by the same lock.
+// ---------------------------------------------------------------------------
+static constexpr int NSHARDS = 16;
+
+struct alignas(64) MapShard {
+    pthread_mutex_t                       lock;
+    std::unordered_map<void*, AllocInfo>* map            = nullptr;
+    std::unordered_map<void*, size_t>*    reported_leaks = nullptr;
+};
+
+static MapShard g_shards[NSHARDS];
+
+static void shards_init()
+{
+    for (auto& sh : g_shards)
+        pthread_mutex_init(&sh.lock, nullptr);
+}
+
+static inline int shard_of(void* ptr)
+{
+    return (int)(((uintptr_t)ptr >> 4) & (NSHARDS - 1));
+}
 
 // Record a user allocation.  Caller must have set in_hook = true first.
 static void map_record(void* ptr, size_t size, const char* op,
                        void** frames, int frame_count, uint64_t ts)
 {
     if (!ptr || is_bootstrap_ptr(ptr)) return;
-    pthread_mutex_lock(&g_lock);
-    if (!g_map) {
+    int s = shard_of(ptr);
+    MapShard& sh = g_shards[s];
+    pthread_mutex_lock(&sh.lock);
+    if (!sh.map) {
         try {
-            g_map = new std::unordered_map<void*, AllocInfo>();
+            sh.map = new std::unordered_map<void*, AllocInfo>();
         } catch (...) {
-            pthread_mutex_unlock(&g_lock);
+            pthread_mutex_unlock(&sh.lock);
             return;
         }
     }
     AllocInfo info;
     info.tid          = (pid_t)syscall(SYS_gettid);
-    memcpy(info.name, get_thread_name(), sizeof(info.name)); // both buffers are 16 B
+    memcpy(info.name, get_thread_name(), sizeof(info.name));
     info.size         = size;
     info.timestamp_us = ts;
     strncpy(info.op, op, sizeof(info.op) - 1);
@@ -183,9 +210,9 @@ static void map_record(void* ptr, size_t size, const char* op,
     info.frame_count = frame_count;
     for (int i = 0; i < frame_count; i++) info.frames[i] = frames[i];
     try {
-        (*g_map)[ptr] = info;
+        (*sh.map)[ptr] = info;
     } catch (...) { /* OOM: lose this record rather than deadlock */ }
-    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&sh.lock);
 }
 
 // Remove a freed pointer.  Only acts when in_hook is false (i.e. this is a
@@ -194,9 +221,10 @@ static void map_remove(void* ptr)
 {
     if (!ptr || is_bootstrap_ptr(ptr) || in_hook) return;
     in_hook = true;
-    pthread_mutex_lock(&g_lock);
-    if (g_map) g_map->erase(ptr);
-    pthread_mutex_unlock(&g_lock);
+    int s = shard_of(ptr);
+    pthread_mutex_lock(&g_shards[s].lock);
+    if (g_shards[s].map) g_shards[s].map->erase(ptr);
+    pthread_mutex_unlock(&g_shards[s].lock);
     in_hook = false;
 }
 
@@ -216,55 +244,70 @@ static void thread_exit_handler(void*)
                  tid, get_thread_name(), (unsigned long long)elapsed_us(), thread_total);
     if (n > 0) outfd_write(buf, (size_t)n);
 
-    // Set in_hook so that g_map->erase() below does not try to re-enter the map.
+    // Set in_hook so that map erases below do not try to re-enter the hooks.
     in_hook = true;
-    pthread_mutex_lock(&g_lock);
 
-    if (g_map) {
-        size_t leak_count = 0;
-        size_t leak_bytes = 0;
+    size_t leak_count = 0;
+    size_t leak_bytes = 0;
 
-        // First pass: report leaks belonging to this thread and register them
-        // in g_reported_leaks so a cross-thread free can cancel the entry.
-        for (auto& [ptr, info] : *g_map) {
-            if (info.tid != tid) continue;
-            ++leak_count;
-            leak_bytes += info.size;
+    // Local buffer for leaks found in one shard.  Populated under the shard
+    // lock; printed after releasing so the lock is held for the minimum time.
+    struct LeakEntry { void* ptr; AllocInfo info; };
+    std::vector<LeakEntry> leaks;
+
+    for (int s = 0; s < NSHARDS; s++) {
+        MapShard& sh = g_shards[s];
+        pthread_mutex_lock(&sh.lock);
+
+        if (sh.map) {
+            leaks.clear();
+            // First pass: collect leaks for this thread.
+            for (auto& [ptr, info] : *sh.map) {
+                if (info.tid != tid) continue;
+                ++leak_count;
+                leak_bytes += info.size;
+                leaks.push_back({ptr, info});
+                // Register in this shard's reported_leaks so a cross-thread
+                // free after this exit handler can cancel the leak entry.
+                if (!sh.reported_leaks) {
+                    try { sh.reported_leaks = new std::unordered_map<void*, size_t>(); }
+                    catch (...) {}
+                }
+                if (sh.reported_leaks) {
+                    try { (*sh.reported_leaks)[ptr] = info.size; } catch (...) {}
+                }
+            }
+            // Second pass: erase this thread's entries.
+            for (auto it = sh.map->begin(); it != sh.map->end(); ) {
+                it = (it->second.tid == tid) ? sh.map->erase(it) : ++it;
+            }
+        }
+
+        pthread_mutex_unlock(&sh.lock);
+
+        // Print LEAK lines without holding the shard lock.
+        for (auto& e : leaks) {
             n = snprintf(buf, sizeof(buf),
                          "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
-                         tid, get_thread_name(), (unsigned long long)info.timestamp_us,
-                         info.op, info.size, ptr);
+                         tid, get_thread_name(), (unsigned long long)e.info.timestamp_us,
+                         e.info.op, e.info.size, e.ptr);
             if (n > 0) outfd_write(buf, (size_t)n);
-            if (info.frame_count > 0)
-                print_frames(info.frames, info.frame_count);
-
-            if (!g_reported_leaks) {
-                try { g_reported_leaks = new std::unordered_map<void*, size_t>(); } catch (...) {}
-            }
-            if (g_reported_leaks) {
-                try { (*g_reported_leaks)[ptr] = info.size; } catch (...) {}
-            }
+            if (e.info.frame_count > 0)
+                print_frames(e.info.frames, e.info.frame_count);
         }
-
-        // Second pass: erase this thread's entries.
-        // (in_hook==true prevents operator delete from trying to re-lock g_lock)
-        for (auto it = g_map->begin(); it != g_map->end(); ) {
-            it = (it->second.tid == tid) ? g_map->erase(it) : ++it;
-        }
-
-        if (leak_count > 0) {
-            n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
-                         tid, get_thread_name(), leak_count, leak_bytes);
-        } else {
-            n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) SUMMARY    all allocations freed\n",
-                         tid, get_thread_name());
-        }
-        if (n > 0) outfd_write(buf, (size_t)n);
     }
 
-    pthread_mutex_unlock(&g_lock);
+    if (leak_count > 0) {
+        n = snprintf(buf, sizeof(buf),
+                     "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
+                     tid, get_thread_name(), leak_count, leak_bytes);
+    } else {
+        n = snprintf(buf, sizeof(buf),
+                     "[memtrack] tid=%-6d (%-15s) SUMMARY    all allocations freed\n",
+                     tid, get_thread_name());
+    }
+    if (n > 0) outfd_write(buf, (size_t)n);
+
     in_hook = false;
 }
 
@@ -283,70 +326,93 @@ static void thread_exit_handler(void*)
 static void atexit_handler()
 {
     in_hook = true;
-    pthread_mutex_lock(&g_lock);
 
-    if (!g_map || g_map->empty()) {
-        pthread_mutex_unlock(&g_lock);
-        in_hook = false;
-        return;
-    }
-
-    char buf[256];
-    int  n;
-
-    // Collect the set of unique tids still in the map.
-    // We do this without extra heap allocation: iterate twice per tid.
+    // First pass over all shards: collect unique TIDs still alive.
     pid_t seen[1024];
     int   seen_count = 0;
-    for (auto& [ptr, info] : *g_map) {
-        bool found = false;
-        for (int i = 0; i < seen_count; i++)
-            if (seen[i] == info.tid) { found = true; break; }
-        if (!found && seen_count < (int)(sizeof(seen)/sizeof(seen[0])))
-            seen[seen_count++] = info.tid;
-    }
-
-    for (int si = 0; si < seen_count; si++) {
-        pid_t       tid        = seen[si];
-        const char* tname      = nullptr;
-        size_t      leak_count = 0;
-        size_t      leak_bytes = 0;
-
-        for (auto& [ptr, info] : *g_map) {
-            if (info.tid != tid) continue;
-            if (!tname) tname = info.name;
-            ++leak_count;
-            leak_bytes += info.size;
-            n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
-                         tid, info.name,
-                         (unsigned long long)info.timestamp_us,
-                         info.op, info.size, (void*)ptr);
-            if (n > 0) outfd_write(buf, (size_t)n);
-            if (info.frame_count > 0)
-                print_frames(info.frames, info.frame_count);
-
-            if (!g_reported_leaks) {
-                try { g_reported_leaks = new std::unordered_map<void*, size_t>(); } catch (...) {}
-            }
-            if (g_reported_leaks) {
-                try { (*g_reported_leaks)[ptr] = info.size; } catch (...) {}
+    for (int s = 0; s < NSHARDS; s++) {
+        pthread_mutex_lock(&g_shards[s].lock);
+        if (g_shards[s].map) {
+            for (auto& [ptr, info] : *g_shards[s].map) {
+                bool found = false;
+                for (int i = 0; i < seen_count; i++)
+                    if (seen[i] == info.tid) { found = true; break; }
+                if (!found && seen_count < (int)(sizeof(seen)/sizeof(seen[0])))
+                    seen[seen_count++] = info.tid;
             }
         }
+        pthread_mutex_unlock(&g_shards[s].lock);
+    }
 
-        if (leak_count > 0) {
-            n = snprintf(buf, sizeof(buf),
-                         "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
-                         tid, tname ? tname : "?",
-                         leak_count, leak_bytes);
-            if (n > 0) outfd_write(buf, (size_t)n);
+    if (seen_count == 0) {
+        in_hook = false;
+        goto signal_eof;
+    }
+
+    {
+        char buf[256];
+        int  n;
+        struct LeakEntry { void* ptr; AllocInfo info; };
+        std::vector<LeakEntry> leaks;
+
+        for (int si = 0; si < seen_count; si++) {
+            pid_t  tid        = seen[si];
+            size_t leak_count = 0;
+            size_t leak_bytes = 0;
+            char   tname[16]  = {};
+
+            // For each shard: collect this TID's entries, erase them, print.
+            for (int s = 0; s < NSHARDS; s++) {
+                MapShard& sh = g_shards[s];
+                pthread_mutex_lock(&sh.lock);
+
+                if (sh.map) {
+                    leaks.clear();
+                    for (auto& [ptr, info] : *sh.map) {
+                        if (info.tid != tid) continue;
+                        if (!tname[0]) memcpy(tname, info.name, sizeof(tname));
+                        ++leak_count;
+                        leak_bytes += info.size;
+                        leaks.push_back({ptr, info});
+                        if (!sh.reported_leaks) {
+                            try { sh.reported_leaks = new std::unordered_map<void*, size_t>(); }
+                            catch (...) {}
+                        }
+                        if (sh.reported_leaks) {
+                            try { (*sh.reported_leaks)[ptr] = info.size; } catch (...) {}
+                        }
+                    }
+                    for (auto it = sh.map->begin(); it != sh.map->end(); ) {
+                        it = (it->second.tid == tid) ? sh.map->erase(it) : ++it;
+                    }
+                }
+
+                pthread_mutex_unlock(&sh.lock);
+
+                for (auto& e : leaks) {
+                    n = snprintf(buf, sizeof(buf),
+                                 "[memtrack] tid=%-6d (%-15s) LEAK       ts=%-12llu %-10s size=%-12zu  ptr=%p\n",
+                                 tid, e.info.name,
+                                 (unsigned long long)e.info.timestamp_us,
+                                 e.info.op, e.info.size, e.ptr);
+                    if (n > 0) outfd_write(buf, (size_t)n);
+                    if (e.info.frame_count > 0)
+                        print_frames(e.info.frames, e.info.frame_count);
+                }
+            }
+
+            if (leak_count > 0) {
+                n = snprintf(buf, sizeof(buf),
+                             "[memtrack] tid=%-6d (%-15s) SUMMARY    %zu unfreed allocation(s), %zu bytes leaked\n",
+                             tid, tname[0] ? tname : "?", leak_count, leak_bytes);
+                if (n > 0) outfd_write(buf, (size_t)n);
+            }
         }
     }
 
-    g_map->clear();
-    pthread_mutex_unlock(&g_lock);
     in_hook = false;
 
+signal_eof:
     // Signal EOF to the viewer.  For TCP sockets use shutdown(SHUT_WR) rather
     // than close() so that threads still running don't write to a recycled fd.
     // For plain files close() is safe here since we're in the atexit handler
@@ -370,6 +436,7 @@ static void atexit_handler()
 
 static void __attribute__((constructor)) memtrack_ctor()
 {
+    shards_init();
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
     if (pthread_key_create(&exit_key, thread_exit_handler) != 0) {
         const char msg[] = "[memtrack] WARNING: pthread_key_create failed; thread-exit leak reports disabled\n";
@@ -617,22 +684,24 @@ static bool log_free_capture(void* ptr, const char* op,
 
     size_t size    = 0;
     bool   tracked = false;
-    pthread_mutex_lock(&g_lock);
-    if (g_map) {
-        auto it = g_map->find(ptr);
-        if (it != g_map->end()) { size = it->second.size; tracked = true; }
+    int    s       = shard_of(ptr);
+    MapShard& sh   = g_shards[s];
+    pthread_mutex_lock(&sh.lock);
+    if (sh.map) {
+        auto it = sh.map->find(ptr);
+        if (it != sh.map->end()) { size = it->second.size; tracked = true; }
     }
-    // Cross-thread free after exit handler: ptr was removed from g_map but
-    // recorded in g_reported_leaks so we can log a cancelling free entry.
-    if (!tracked && g_reported_leaks) {
-        auto it2 = g_reported_leaks->find(ptr);
-        if (it2 != g_reported_leaks->end()) {
+    // Cross-thread free after exit handler: ptr was removed from the shard map
+    // but recorded in reported_leaks so we can log a cancelling free entry.
+    if (!tracked && sh.reported_leaks) {
+        auto it2 = sh.reported_leaks->find(ptr);
+        if (it2 != sh.reported_leaks->end()) {
             size    = it2->second;
             tracked = true;
-            g_reported_leaks->erase(it2);
+            sh.reported_leaks->erase(it2);
         }
     }
-    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&sh.lock);
 
     if (!tracked) {
         in_hook = false;
@@ -647,7 +716,7 @@ static bool log_free_capture(void* ptr, const char* op,
     if (n > 0) outfd_write(buf, (size_t)n);
 
     // in_hook remains TRUE on return.  Caller must:
-    //   1. erase ptr from g_map (under g_lock)
+    //   1. erase ptr from its shard (under the shard lock)
     //   2. call real_free(ptr)
     //   3. set in_hook = false
     //   4. call print_frames if frame_count > 0
@@ -738,9 +807,12 @@ void* realloc(void* old_ptr, size_t size)
     // Hold in_hook while we erase old_ptr and call real_realloc so no other
     // thread can slip in between and re-use the same address in our map.
     in_hook = true;
-    pthread_mutex_lock(&g_lock);
-    if (g_map) g_map->erase(old_ptr);
-    pthread_mutex_unlock(&g_lock);
+    {
+        int s = shard_of(old_ptr);
+        pthread_mutex_lock(&g_shards[s].lock);
+        if (g_shards[s].map) g_shards[s].map->erase(old_ptr);
+        pthread_mutex_unlock(&g_shards[s].lock);
+    }
 
     void* p = real_realloc(old_ptr, size);
     if (!p) {
@@ -767,9 +839,10 @@ void free(void* ptr)
     bool  tracked = log_free_capture(ptr, "free", frames, frame_count);
 
     if (tracked) {
-        pthread_mutex_lock(&g_lock);
-        if (g_map) g_map->erase(ptr);
-        pthread_mutex_unlock(&g_lock);
+        int s = shard_of(ptr);
+        pthread_mutex_lock(&g_shards[s].lock);
+        if (g_shards[s].map) g_shards[s].map->erase(ptr);
+        pthread_mutex_unlock(&g_shards[s].lock);
     }
     real_free(ptr);
     if (tracked) in_hook = false;
@@ -816,13 +889,14 @@ static inline void cpp_free(void* p, const char* op) noexcept
     bool  tracked = log_free_capture(p, op, frames, frame_count);
     // If tracked, in_hook is now TRUE — we own the cleanup.
 
-    // Erase from g_map and physically free while in_hook=true.
+    // Erase from the shard and physically free while in_hook=true.
     // Any reentrant free(p) during this window sees in_hook=true and exits
     // early, so real_free cannot be called twice.
     if (tracked) {
-        pthread_mutex_lock(&g_lock);
-        if (g_map) g_map->erase(p);
-        pthread_mutex_unlock(&g_lock);
+        int s = shard_of(p);
+        pthread_mutex_lock(&g_shards[s].lock);
+        if (g_shards[s].map) g_shards[s].map->erase(p);
+        pthread_mutex_unlock(&g_shards[s].lock);
     }
     real_free(p);
 
