@@ -41,7 +41,7 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
 | `MEMTRACK_STACK_DEPTH` | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
 | `MEMTRACK_DEMANGLE`    | `0`           | Set to `1` to demangle C++ symbols in memtrack's log output. By default symbols are left mangled and `memview` demangled them on display. |
-| `MEMTRACK_COMPACT`     | `1`           | When `1` (default), store only `tid`, `name`, and `size` per live allocation (~28 bytes) instead of the full record including stack frames (~308 bytes). Compact mode reduces per-allocation overhead by ~11×. Set to `0` for standalone log analysis without memview (LEAK lines will include op, timestamp, and reprinted stack frames). |
+| `MEMTRACK_COMPACT`     | `1`           | When `1` (default), memtrack keeps **no in-memory map** of live allocations. Free hooks log `ptr=` only (no `size=`), and no LEAK/SUMMARY lines are emitted at thread exit — memview detects leaks by matching alloc/free ptrs in the log. This eliminates all lock contention on the free path and removes ~300–400 bytes per live allocation. Set to `0` for standalone log analysis without memview (LEAK lines will include op, timestamp, and reprinted stack frames). |
 
 ### TCP server mode
 
@@ -314,17 +314,26 @@ memtrack is a debugging tool; its overhead is significant and it is **not intend
 | `write()` syscall | **High** | One per allocation and one per free to write the log line |
 | `clock_gettime(CLOCK_MONOTONIC)` | Medium | One syscall per event for the timestamp |
 | `syscall(SYS_gettid)` | Medium | Called on every allocation (not cached) |
-| `unordered_map` insert/find/erase | Medium | O(1) amortised; internal allocs are hidden by `in_hook` |
+| `unordered_map` insert/find/erase | Medium | O(1) amortised; only applies in full mode (`MEMTRACK_COMPACT=0`) |
 | `backtrace()` | **Very high** (if enabled) | 10–100 µs per call depending on stack depth; disabled by default |
 | `backtrace_symbols()` + `__cxa_demangle` | **Very high** (if enabled) | Demangling is especially expensive; only called when printing |
 
-**Typical slowdown** (stack traces off): **3–10×** for allocation-heavy workloads, driven by the global mutex and two syscalls per event. With `MEMTRACK_STACK_DEPTH=5` the slowdown can reach **50–100×**.
+**Typical slowdown** (stack traces off):
 
-The biggest scalability bottleneck is the **global mutex** — it serialises every `malloc`/`free` across all threads. A multi-threaded program with high allocation rates will see near-linear lock contention.
+| Mode | Slowdown | Bottleneck |
+|------|----------|------------|
+| Compact (default) | **1.5–3×** | Two `write()` syscalls + two `clock_gettime` calls per alloc/free pair |
+| Full (`MEMTRACK_COMPACT=0`) | **3–10×** | Mutex contention + map insert/erase + same syscalls |
+
+With `MEMTRACK_STACK_DEPTH=5` the slowdown can reach **50–100×** in either mode.
+
+In compact mode, the **free hook is completely lock-free** — it does one `clock_gettime`, one snprintf into a stack buffer, and one `write()`. All mutex contention is eliminated.
 
 ### Memory overhead
 
-Each live tracked allocation occupies one `std::unordered_map` node containing an `AllocInfo` struct:
+In **compact mode** (default): **zero per-allocation heap overhead** — no map is kept. memtrack writes each event directly to the log file and forgets it. Resident memory cost is limited to the file write buffer (~4 KB, kernel-managed) plus a few hundred bytes of per-thread state.
+
+In **full mode** (`MEMTRACK_COMPACT=0`): each live tracked allocation occupies one `std::unordered_map` node containing an `AllocInfo` struct:
 
 | Field | Size |
 |-------|------|
@@ -342,17 +351,19 @@ Freed allocations are removed immediately, so only *live* allocations incur this
 
 - **Bootstrap allocator** — `dlsym()` itself calls `calloc` during startup before the real function pointers are resolved. A static 64 KB buffer handles those early allocations safely.
 
-- **`in_hook` (thread-local bool)** — set to `true` for the entire duration of any hook or internal helper (`log_alloc`, `log_free`, `map_record`, `print_frames`, `thread_exit_handler`). This prevents recursive hook calls *and* ensures that internal allocations (map nodes, `backtrace_symbols` buffers, demangled strings) are never tracked. Critically, `log_free()` holds `in_hook = true` across the call to `print_frames()` so that `backtrace_symbols()`'s internal `malloc` is invisible to the tracker.
+- **`in_hook` (thread-local bool)** — set to `true` for the entire duration of any hook or internal helper (`log_alloc`, `log_free_capture`, `print_frames`, `thread_exit_handler`). This prevents recursive hook calls *and* ensures that internal allocations (demangled strings in full mode) are never tracked.
 
-- **`map_remove` deadlock prevention** — `g_map->erase()` frees internal hash-map nodes via `operator delete`, which would re-enter the map lock. `map_remove` is a no-op when `in_hook == true`, breaking the cycle. All internal map operations happen while `in_hook` is already `true`.
+- **Compact mode lock-freedom** — in compact mode (`MEMTRACK_COMPACT=1`, the default), no in-memory map is maintained. Free hooks log the pointer and return immediately, without acquiring any mutex. Leak detection is delegated entirely to memview, which reconstructs the alloc/free lifecycle from the log by matching `ptr=` fields with line-number awareness to handle address reuse.
 
-- **`pthread_key` destructor** — `thread_exit_handler` is registered via `pthread_key_create`. It fires when any thread exits (including threads not created by your code), printing the EXIT/LEAK/SUMMARY lines and erasing that thread's entries from the global map.
+- **Sharded map (full mode)** — the map is split into 16 independently-locked shards (`g_shards[16]`, each `alignas(64)` to avoid false sharing). The shard for a pointer is selected by `(uintptr_t(ptr) >> 4) & 15`. This reduces lock contention by up to 16× compared to a single global lock, at the cost of 16 small mutex initialisation calls at startup.
 
-- **Cross-thread LEAK cancellation (`g_reported_leaks`)** — when `thread_exit_handler` logs a LEAK for a pointer, it also inserts the pointer and its size into a secondary map `g_reported_leaks` (protected by the same `g_lock`). If another thread later frees that pointer, the free hook finds it in `g_reported_leaks`, logs the free normally, and removes it from the secondary map. memview recognises this pattern and clears the `is_leak` flag, decrementing the thread's leak count and leak bytes.
+- **`pthread_key` destructor** — `thread_exit_handler` is registered via `pthread_key_create`. In compact mode it emits only an EXIT line and returns. In full mode it also scans the thread's shard entries for leaked allocations and emits LEAK/SUMMARY lines.
+
+- **Cross-thread LEAK cancellation** — in full mode, when `thread_exit_handler` logs a LEAK for a pointer, it also records it in `sh.reported_leaks`. If another thread later frees that pointer, the free hook finds it there, logs the free, and removes the entry. memview recognises this pattern (free line appears after EXIT) and clears `is_leak`. In compact mode, memview handles this entirely by comparing line numbers of EXIT and free events.
 
 - **Timestamps** — `clock_gettime(CLOCK_MONOTONIC)` is captured in `memtrack_ctor()` as the zero point. Each event records microseconds elapsed since that point. Allocations before the constructor fires (early runtime init) are recorded with `ts=0`.
 
-- **Stack traces & demangling** — `backtrace()` is called skipping two internal frames (the hook + `log_alloc`/`log_free`) so `#0` is always user code. `backtrace_symbols()` output is parsed to extract the mangled symbol, which is passed to `abi::__cxa_demangle()`. The demangled buffer and the symbols array are both freed with `real_free()` to avoid tracking.
+- **Stack traces & demangling** — `backtrace()` is called skipping two internal frames (the hook + `log_alloc`/`log_free`) so `#0` is always user code. By default memtrack emits raw mangled names; memview demandles on display using `abi::__cxa_demangle`. Set `MEMTRACK_DEMANGLE=1` to demangle in the log instead.
 
 - **`write()` for output** — uses the `write(2)` syscall directly instead of `printf`/`fprintf` to avoid stdio buffering and re-entrant allocation inside the hook.
 
@@ -361,5 +372,5 @@ Freed allocations are removed immediately, so only *live* allocations incur this
 ## Limitations
 
 - `posix_memalign`, `aligned_alloc`, `memalign`, `valloc`, `strdup`, and `strndup` are not intercepted.
-- The leak report only fires on *thread exit* (via `pthread_key` destructor). If the process is killed with `SIGKILL`, exit reports are not printed.
+- The leak report only fires on *thread exit* (via `pthread_key` destructor). If the process is killed with `SIGKILL`, exit reports are not printed. memview handles this by marking all still-unfreed allocations as leaked at EOF.
 - Not intended for production use — see [Overhead](#overhead) above.

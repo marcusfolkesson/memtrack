@@ -154,7 +154,19 @@ static void parse_line(const char* line, ParseState& st)
     if (!strcmp(op, "EXIT")) {
         size_t total = 0;
         sscanf(after, "EXIT total=%zu", &total);
-        st.thread(tid, tname).total_bytes = total;
+        auto& th = st.thread(tid, tname);
+        th.total_bytes = total;
+        // Mark this thread's still-unfreed allocations as leaked.
+        // In full mode, subsequent SUMMARY lines will overwrite th.leak_count/
+        // leak_bytes with authoritative values; in compact mode (no SUMMARY)
+        // these are the final values.
+        for (auto& r : st.records) {
+            if (r.tid == tid && !r.freed && !r.is_leak) {
+                r.is_leak = true;
+                th.leak_count++;
+                th.leak_bytes += r.size;
+            }
+        }
         return;
     }
 
@@ -218,10 +230,15 @@ static void parse_line(const char* line, ParseState& st)
 
     // ── Free ──────────────────────────────────────────────────────────────
     if (is_free_op(op)) {
-        size_t sz      = 0;
         void*  ptr_raw = nullptr;
         unsigned long long ts_ull = 0;
-        sscanf(after, "%*s ts=%llu size=%zu ptr=%p", &ts_ull, &sz, &ptr_raw);
+        // Use strstr-based extraction to handle both:
+        //   full mode:    "free ts=N size=N ptr=0x..."
+        //   compact mode: "free ts=N ptr=0x..."  (no size= field)
+        const char* pts  = strstr(after, "ts=");
+        const char* pptr = strstr(after, "ptr=");
+        if (pts)  sscanf(pts,  "ts=%llu",  &ts_ull);
+        if (pptr) sscanf(pptr, "ptr=%p",   &ptr_raw);
         uintptr_t ptr = (uintptr_t)ptr_raw;
 
         // Register the freeing thread (so 't' can filter by it) but apply the
@@ -256,9 +273,26 @@ static void parse_line(const char* line, ParseState& st)
     }
 }
 
-static ParseState parse_file(const string& path, long* out_pos = nullptr)
+// Mark every remaining unfreed allocation as a leak and update thread stats.
+// Called when the log stream is complete (file EOF or TCP disconnect).
+// In compact mode memtrack never emits LEAK/SUMMARY lines, so memview is
+// responsible for detecting leaks.  In full mode this is a safe no-op
+// because those records will have already been marked via LEAK lines,
+// and SUMMARY overwrites the thread totals with authoritative values.
+static void finalize_leaks(ParseState& st)
 {
-    ParseState st;
+    for (auto& r : st.records) {
+        if (!r.freed && !r.is_leak) {
+            r.is_leak = true;
+            auto& th = st.thread(r.tid, r.thread_name);
+            th.leak_count++;
+            th.leak_bytes += r.size;
+        }
+    }
+}
+
+static ParseState parse_file(const string& path, long* out_pos = nullptr)
+{    ParseState st;
     FILE* fp = fopen(path.c_str(), "r");
     if (!fp) {
         if (out_pos) *out_pos = 0;
@@ -409,10 +443,11 @@ struct LiveReader {
         }
 
         if (is_socket) {
-            if (feof(fp)) { disconnected = true; return false; }
+            if (feof(fp)) { finalize_leaks(st); disconnected = true; return false; }
             clearerr(fp);
         } else if (is_stdin) {
-            // nothing — non-blocking stdin may legitimately have no data
+            if (feof(fp)) { finalize_leaks(st); disconnected = true; }
+            else clearerr(fp);
         } else {
             long p = ftell(fp);
             if (p >= 0) pos = p;
@@ -1482,6 +1517,9 @@ int main(int argc, char* argv[])
     long initial_pos = 0;
     string real_path = (path == "-") ? "/dev/stdin" : path;
     ParseState ps = parse_file(real_path, &initial_pos);
+    // Non-live mode: the file is complete — mark remaining unfreed allocations
+    // as leaks (needed for compact mode which emits no LEAK/SUMMARY lines).
+    if (!live) finalize_leaks(ps);
 
     if (!live && ps.records.empty()) {
         fprintf(stderr, "No memtrack records found in '%s'.\n"
