@@ -1096,9 +1096,10 @@ static void draw_threads(WINDOW* w, const UI& ui)
     for (int i = 0; i < page && (top + i) < total; i++) {
         const ThreadInfo& t = *sorted[top + i];
         size_t net = t.net();
-        bool   selected_thread = (ui.tid_filter == t.tid);
+        // "all threads" mode: highlight every row; otherwise only the filtered one.
+        bool selected_thread = (ui.tid_filter == -1) || (ui.tid_filter == t.tid);
         int cp   = selected_thread ? C_SEL : (net > 0 ? C_LEAK : C_ALLOC);
-        int attr = selected_thread ? (int)A_BOLD : 0;
+        int attr = (selected_thread && ui.tid_filter != -1) ? (int)A_BOLD : 0;
 
         char leak_buf[32] = "-";
         if (t.leak_count > 0)
@@ -1348,6 +1349,20 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 // Pause auto-follow so the user can browse the filtered view.
                 if (live) ui.auto_follow = false;
                 ui.rebuild();
+
+                // Scroll the Thread Summary pane so the selected thread is visible.
+                // Must happen AFTER rebuild() since rebuild(reset_scroll=true) resets hotfn_top.
+                if (ui.tid_filter != -1) {
+                    int pos = 0;
+                    for (size_t i = 0; i < order.size(); i++) {
+                        if (order[i] == ui.tid_filter) { pos = (int)i; break; }
+                    }
+                    int th_page = threads_pane_h((int)ps.threads.size()) - THREADS_HDR;
+                    if (pos < ui.hotfn_top)
+                        ui.hotfn_top = pos;
+                    if (pos >= ui.hotfn_top + th_page)
+                        ui.hotfn_top = pos - th_page + 1;
+                }
             }
             goto next_draw;
         }
