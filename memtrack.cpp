@@ -653,6 +653,12 @@ void* realloc(void* old_ptr, size_t size)
     // Log the free event first (captures stack, checks map, writes log).
     log_free(old_ptr, "free");   // sets in_hook=false on return
 
+    // Log the implicit free of old_ptr before we erase it from the map.
+    // This ensures the log has a matching free entry even when real_realloc
+    // returns the same address (in-place growth), preventing memview from
+    // treating the old record as a phantom leak.
+    log_free(old_ptr, "free");
+
     // Hold in_hook while we erase old_ptr and call real_realloc so no other
     // thread can slip in between and re-use the same address in our map.
     in_hook = true;
