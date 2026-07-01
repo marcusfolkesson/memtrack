@@ -525,6 +525,7 @@ struct UI {
     bool           group_sort_rev  = false;
     vector<LeakGroup> groups;                // populated when group_mode==true
     uint64_t       lifetime_min_us = 0;      // 0 = disabled; hide allocations younger than this
+    string         search_str;               // empty = disabled; case-insensitive substring filter
 
     // reset_scroll=true: reset selection and scroll (filter changes, full reset).
     // reset_scroll=false: preserve selection and scroll (incremental data update).
@@ -548,6 +549,31 @@ struct UI {
             if (lifetime_min_us > 0) {
                 uint64_t age = (max_ts >= r.timestamp_us) ? (max_ts - r.timestamp_us) : 0;
                 if (age < lifetime_min_us) continue;
+            }
+            // Symbol search: case-insensitive substring across frames, thread, op, ptr
+            if (!search_str.empty()) {
+                auto ci_contains = [&](const string& haystack) {
+                    if (haystack.size() < search_str.size()) return false;
+                    auto it = std::search(haystack.begin(), haystack.end(),
+                                         search_str.begin(), search_str.end(),
+                                         [](char a, char b) {
+                                             return tolower((unsigned char)a) ==
+                                                    tolower((unsigned char)b);
+                                         });
+                    return it != haystack.end();
+                };
+                bool match = ci_contains(r.thread_name) || ci_contains(r.op);
+                if (!match) for (const auto& f : r.frames)
+                    if (ci_contains(f)) { match = true; break; }
+                if (!match) for (const auto& f : r.free_frames)
+                    if (ci_contains(f)) { match = true; break; }
+                // Also match hex pointer string
+                if (!match) {
+                    char ptr_hex[20];
+                    snprintf(ptr_hex, sizeof(ptr_hex), "0x%014" PRIxPTR, r.ptr);
+                    match = ci_contains(ptr_hex);
+                }
+                if (!match) continue;
             }
             visible.push_back(i);
         }
@@ -767,6 +793,9 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
               sort_label[ui.sort],
               ui.sort_rev ? " ▲" : " ▼",
               leaks, fmt_size(leak_bytes).c_str());
+    if (!ui.search_str.empty()) {
+        wprintw(w, "  │  Search: %s", ui.search_str.c_str());
+    }
     if (ui.lifetime_min_us > 0) {
         wprintw(w, "  │  Age≥%s", fmt_time_ms(ui.lifetime_min_us).c_str());
     }
@@ -1264,7 +1293,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  a:age-filter  t/T:thread(fwd/bk)  s/S:sort(rev)  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
+                  " q:quit  f:filter  a:age  /:search  t/T:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot  L:src-lines%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1695,6 +1724,14 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.lifetime_min_us = (uint64_t)(secs * 1e6);
                 ui.rebuild();
             }
+            goto next_draw;
+        }
+
+        // Symbol / text search: '/' prompts for substring, empty clears filter
+        if (ch == '/') {
+            string s = prompt_input(win.status, "Search (frames/thread/op, empty=clear): ");
+            ui.search_str = s;
+            ui.rebuild();
             goto next_draw;
         }
 
