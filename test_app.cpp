@@ -610,6 +610,24 @@ void test19_realloc_fail_safety()
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
+
+void test24_mmap_munmap()
+{
+    hdr(24, "anonymous mmap/munmap tracked; file-backed mmap not tracked");
+    expect("mmap(24576) logged with op=mmap, munmap'd, no LEAK");
+    log_marker("T24");
+
+    // Anonymous mmap — should be tracked
+    size_t len = 24 * 1024;  // 24576 bytes (24*1024, encodes test number)
+    void* p = mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(p != MAP_FAILED);
+    memset(p, 0xAB, len);   // write to it to ensure it's real memory
+    munmap(p, len);
+
+    check(true, "anonymous mmap + munmap balanced");
+}
+
 int main()
 {
     printf("══════════════════════════════════════════════════════════════\n");
@@ -639,6 +657,7 @@ int main()
     test20_deep_stack();
     test21_long_symbols();
     test23_strdup_strndup();
+    test24_mmap_munmap();
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════\n");

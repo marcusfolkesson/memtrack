@@ -110,12 +110,14 @@ static bool is_alloc_op(const char* op)
 {
     return !strcmp(op,"malloc") || !strcmp(op,"calloc") ||
            !strcmp(op,"realloc") || !strcmp(op,"new") || !strcmp(op,"new[]") ||
-           !strcmp(op,"strdup") || !strcmp(op,"strndup");
+           !strcmp(op,"strdup") || !strcmp(op,"strndup") ||
+           !strcmp(op,"mmap") || !strcmp(op,"mremap");
 }
 
 static bool is_free_op(const char* op)
 {
-    return !strcmp(op,"free") || !strcmp(op,"delete") || !strcmp(op,"delete[]");
+    return !strcmp(op,"free") || !strcmp(op,"delete") || !strcmp(op,"delete[]") ||
+           !strcmp(op,"munmap");
 }
 
 static void parse_line(const char* line, ParseState& st)

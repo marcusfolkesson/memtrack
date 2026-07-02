@@ -19,6 +19,8 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <stdarg.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
@@ -73,6 +75,9 @@ static void* (*real_realloc)(void*,size_t)  = nullptr;
 static void  (*real_free   )(void*)         = nullptr;
 static char* (*real_strdup )(const char*)   = nullptr;
 static char* (*real_strndup)(const char*, size_t) = nullptr;
+static void* (*real_mmap   )(void*,size_t,int,int,int,off_t) = nullptr;
+static int   (*real_munmap )(void*,size_t)  = nullptr;
+static void* (*real_mremap )(void*,size_t,size_t,int,...) = nullptr;
 
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
 static void do_resolve()
@@ -83,6 +88,9 @@ static void do_resolve()
     real_free    = (void(*)(void*))         dlsym(RTLD_NEXT, "free");
     real_strdup  = (char*(*)(const char*))          dlsym(RTLD_NEXT, "strdup");
     real_strndup = (char*(*)(const char*, size_t))  dlsym(RTLD_NEXT, "strndup");
+    real_mmap    = (void*(*)(void*,size_t,int,int,int,off_t)) dlsym(RTLD_NEXT, "mmap");
+    real_munmap  = (int(*)(void*,size_t))            dlsym(RTLD_NEXT, "munmap");
+    real_mremap  = (void*(*)(void*,size_t,size_t,int,...)) dlsym(RTLD_NEXT, "mremap");
 }
 static void resolve() { pthread_once(&resolve_once, do_resolve); }
 
@@ -674,6 +682,79 @@ char* strndup(const char* s, size_t n)
 }
 
 } // extern "C" (strdup/strndup)
+
+// ---------------------------------------------------------------------------
+// mmap / munmap / mremap
+//
+// Only anonymous mappings (MAP_ANONYMOUS) represent heap-like allocations.
+// File-backed mmaps are I/O and deliberately not tracked to avoid noise.
+// mremap is treated as free(old) + alloc(new) so the tracker stays balanced.
+// ---------------------------------------------------------------------------
+extern "C" {
+
+void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    if (!real_mmap) resolve();
+    void* p = real_mmap(addr, length, prot, flags, fd, offset);
+    if (p == MAP_FAILED) return p;
+
+    // Only track anonymous mappings; skip file-backed and in-hook calls.
+    bool anon = (flags & MAP_ANONYMOUS) || (fd == -1);
+    if (!in_hook && anon && length > 0) {
+        in_hook = true;
+        log_alloc("mmap", length, p);
+        in_hook = false;
+    }
+    return p;
+}
+
+int munmap(void* addr, size_t length)
+{
+    if (!real_munmap) resolve();
+    if (!in_hook && addr && length > 0) {
+        // Log the free before the actual unmap so the address is still valid
+        // for stack capture purposes.
+        bool tracked = log_free_capture(addr, "munmap");
+        int ret = real_munmap(addr, length);
+        if (tracked) in_hook = false;
+        return ret;
+    }
+    return real_munmap(addr, length);
+}
+
+void* mremap(void* old_addr, size_t old_size, size_t new_size, int flags, ...)
+{
+    if (!real_mremap) resolve();
+
+    // mremap may take an optional new_address argument when MREMAP_FIXED is set.
+    void* new_addr_arg = nullptr;
+    if (flags & MREMAP_FIXED) {
+        va_list ap;
+        va_start(ap, flags);
+        new_addr_arg = va_arg(ap, void*);
+        va_end(ap);
+    }
+
+    if (!in_hook && old_addr && old_size > 0) {
+        in_hook = true;
+        // Log free of old region
+        log_free(old_addr, "mremap");
+
+        void* p = (flags & MREMAP_FIXED)
+                      ? real_mremap(old_addr, old_size, new_size, flags, new_addr_arg)
+                      : real_mremap(old_addr, old_size, new_size, flags);
+        if (p != MAP_FAILED && new_size > 0)
+            log_alloc("mremap", new_size, p);
+        in_hook = false;
+        return p;
+    }
+
+    return (flags & MREMAP_FIXED)
+               ? real_mremap(old_addr, old_size, new_size, flags, new_addr_arg)
+               : real_mremap(old_addr, old_size, new_size, flags);
+}
+
+} // extern "C" (mmap/munmap/mremap)
 
 // ---------------------------------------------------------------------------
 // C++ operator new / delete

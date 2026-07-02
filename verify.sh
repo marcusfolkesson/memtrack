@@ -486,6 +486,20 @@ strndup_leak=$(grep -cP '^\[memtrack\].*LEAK.*\) strndup\b' "$LOG" || true)
     && pass "T23: strdup/strndup allocations not leaked" \
     || fail "T23: unexpected LEAK for strdup/strndup ($strdup_leak/$strndup_leak)"
 
+# ── T24: mmap / munmap ───────────────────────────────────────────────────────
+echo ""
+echo "── T24: anonymous mmap/munmap tracking ──────────────────────────────────"
+
+mmap_alloc=$(grep -cP '^\[memtrack\] tid=.*\) mmap\s.*size=24576\b' "$LOG" || true)
+[[ "$mmap_alloc" -ge 1 ]] \
+    && pass "T24: mmap(24576) logged with op=mmap" \
+    || fail "T24: mmap(24576) not found in log"
+
+mmap_leak=$(grep -cP '^\[memtrack\].*LEAK.*\) mmap\b' "$LOG" || true)
+[[ "$mmap_leak" -eq 0 ]] \
+    && pass "T24: mmap allocation not leaked (munmap'd)" \
+    || fail "T24: mmap region shown as LEAK ($mmap_leak)"
+
 echo ""
 echo "══════════════════════════════════════════════════════════════"
 printf "  Total: \033[32m%d passed\033[0m, \033[31m%d failed\033[0m\n" "$PASS" "$FAIL"
