@@ -6,7 +6,7 @@ The library is partly made with Claude Sonnet 4.6.
 
 ## Features
 
-- Intercepts `malloc`, `calloc`, `realloc`, `free`, `strdup`, `strndup`, `operator new`, `operator delete` (including sized-delete C++14 overloads)
+- Intercepts `malloc`, `calloc`, `realloc`, `free`, `strdup`, `strndup`, `mmap` (anonymous), `munmap`, `mremap`, `operator new`, `operator delete` (including sized-delete C++14 overloads)
 - Every allocation and free is logged with its **size**, **thread ID**, **thread name**, and **timestamp** (µs since program start)
 - Per-thread **running total** of bytes allocated
 - On thread exit: **cumulative total** and a **leak report** listing every pointer that was never freed
@@ -15,13 +15,7 @@ The library is partly made with Claude Sonnet 4.6.
 - Optional **per-thread stack trace filter** (`MEMTRACK_STACK_THREADS`) to capture frames only for threads of interest
 - Output to a **file** or stderr
 - **Minimum size filter** to ignore small allocations
-- Companion **ncurses TUI** (`memview`) for interactive browsing:
-  - Live follow mode for monitoring running applications
-  - **Group mode** — fold leaks by call site (count + total bytes)
-  - **Delta mode** (`m`) — snapshot a point in time and show only what was allocated after
-  - **Symbol search** (`/`) — filter by function name, thread, or pointer
-  - **Age filter** (`a`) — hide short-lived allocations below a time threshold
-  - **Jump to group** (`Enter`) — navigate between individual and grouped views instantly
+- Companion **ncurses TUI** (`memview`) for interactive browsing
 
 ## Build
 
@@ -46,9 +40,9 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_PORT`        | _(none)_      | Start a TCP server on this port. The application **pauses at startup** until a client connects (e.g., `memview :PORT`). Output goes to the connected client instead of a file. Takes priority over `MEMTRACK_OUTPUT`. |
 | `MEMTRACK_OUTPUT`      | _(stderr)_    | Write all output to this file instead of stderr. Created/truncated at startup. |
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
-| `MEMTRACK_STACK_DEPTH`   | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. Symbols are emitted raw (mangled); `memview` demandles them on display. |
-| `MEMTRACK_STACK_THREADS` | *(all)*       | Comma-separated list of thread-name substrings. When set, only threads whose name contains one of the substrings capture stack frames; all other threads skip the `backtrace()` call entirely. The result is cached per thread after the thread name is established. Example: `MEMTRACK_STACK_THREADS=Remote,Worker` captures frames only for threads named `Remote` and `Worker*`. Requires `MEMTRACK_STACK_DEPTH > 0`. |
-| `MEMTRACK_BUFFER_SIZE`   | `4096`        | Per-thread output buffer size. Accepts a plain byte count or a `K`/`M` suffix, e.g. `64K` or `1M`. Events are accumulated in a thread-local buffer and flushed in one `write()` call when the buffer is full, at thread exit, or at process exit. The default 4096 matches `PIPE_BUF` (guaranteed atomic on pipes) and reduces syscall overhead ~20% with minimal data-loss risk on crash. Set to `0` to disable buffering (one `write()` per event). |
+| `MEMTRACK_STACK_DEPTH`   | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
+| `MEMTRACK_STACK_THREADS` | *(all)*       | Comma-separated list of thread-name substrings. When set, only threads whose name contains one of the substrings capture stack frames. Example: `MEMTRACK_STACK_THREADS=Remote,Worker`. Requires `MEMTRACK_STACK_DEPTH > 0`. |
+| `MEMTRACK_BUFFER_SIZE`   | `4096`        | Per-thread output buffer size. Accepts a plain byte count or a `K`/`M` suffix, e.g. `64K` or `1M`. Set to `0` to disable buffering (one `write()` per event). |
 
 
 ### TCP server mode
@@ -92,7 +86,7 @@ The connection is closed automatically when the application exits, at which poin
 [memtrack] tid=<tid> (<name>          ) EXIT       ts=<µs>       total=<bytes>   bytes allocated
 ```
 
-Leak detection is handled entirely by `memview`, which reconstructs the allocation lifecycle from the log by matching `ptr=` fields. No LEAK or SUMMARY lines are emitted by memtrack itself.
+Leak detection is handled entirely by `memview`, which reconstructs the allocation lifecycle from the log by matching `ptr=` fields.
 
 ### Field reference
 
@@ -100,26 +94,11 @@ Leak detection is handled entirely by `memview`, which reconstructs the allocati
 |--------|-------------|
 | `tid`  | Linux thread ID (`gettid`) |
 | `name` | Thread name (up to 15 chars, set via `pthread_setname_np`) |
-| `op`   | `malloc` / `calloc` / `realloc` / `new` / `new[]` / `free` / `delete` / `delete[]` |
-| `ts`   | Microseconds since the library constructor ran (0 for pre-constructor allocations) |
+| `op`   | `malloc` / `calloc` / `realloc` / `new` / `new[]` / `free` / `delete` / `delete[]` / `strdup` / `strndup` / `mmap` / `munmap` / `mremap` |
+| `ts`   | Microseconds since the library constructor ran |
 | `size` | Bytes requested/freed |
 | `total`| Cumulative bytes allocated by this thread |
 | `ptr`  | Pointer address |
-
-### Example
-
-```
-[memtrack] tid=12345  (main           ) malloc     ts=11           size=1024         total=1024          ptr=0x55a1b...
-[memtrack] tid=12345  (main           ) realloc    ts=22           size=2048         total=3072          ptr=0x55a1b...
-[memtrack] tid=12345  (main           ) free       ts=29           ptr=0x55a1b...
-[memtrack] tid=12346  (worker-1       ) malloc     ts=267          size=512          total=512           ptr=0x7f48b...
-[memtrack]   #0  ./app(thread_fn()+0x91) [0x55a1b...]
-[memtrack]   #1  /usr/lib/libc.so.6(__libc_start_main+0x89) [0x7f48a...]
-[memtrack] tid=12346  (worker-1       ) EXIT       ts=290          total=512         bytes allocated
-[memtrack] tid=12345  (main           ) free       ts=310          ptr=0x7f48b...
-```
-
-The last line shows how a cross-thread free is logged after the allocating thread has exited. memview cancels the corresponding leak entry when it encounters this free.
 
 ---
 
@@ -154,135 +133,122 @@ The saved file is a valid memtrack log that can be replayed later with `./memvie
 ```
 ┌─ ● LIVE  run.log  │  42 allocs  │  3 shown ────────────────────────────────────────────────────────────┐
 │ Filter: Leaks    │  Thread: worker-1       │  Sort: Time ▼  │  Leaks: 1  (512 B)  │  Follow: ON [F]     │
-├──────────────────────────────────────────────────────────────────┬────────────────────────────────────────┤
-│ St. Pointer             Op        Time        Size      Thread   │ Detail [↑↓ scroll]                     │
-│ [L] 0x7f4860000880      realloc   0.267ms     512 B     worker-1 │ ── Allocation ──────────────────────── │
-│ [A] 0x55b29f0a8160      malloc    0.376ms     128 B     worker-2 │   Op      : realloc                    │
-│                                                                  │   Ptr     : 0x7f4860000880              │
-│                                                                  │   Size    : 512 B                       │
-│                                                                  │   Total   : 640 B                       │
-│                                                                  │   Time    : 0.267ms                     │
-│                                                                  │   tid     : 12346                       │
-│                                                                  │   Thread  : worker-1                    │
-│                                                                  │                                         │
-│                                                                  │   Stack:                                 │
-│                                                                  │     #0  ./app(thread_fn()+0x91)          │
-│                                                                  │     #1  /usr/lib/libc.so.6(...)          │
-│                                                                  │                                         │
-│                                                                  │ ── Free ───────────────────────────────  │
-│                                                                  │   *** NOT FREED — MEMORY LEAK ***        │
-├──────────────────────────────────────────────────────────────────┴────────────────────────────────────────┤
-│ Thread              TID      Allocated       Freed    Net(live)  Leaks           │                         │
-│ main                12345    1.2 MB          1.1 MB   82.0 KB    -               │                         │
-│ worker-1            12346    640 B           0 B      640 B      1 (512 B)       │                         │
-│ worker-2            12347    839 B           839 B    0 B        -               │                         │
-├──────────────────────────────────────────────────────────────────────────────────┴─────────────────────────┤
-│ Top functions  1-5/12 ─ ...                                                                                 │
-│  Function                        Allocated      Freed       Net (live)                                      │
-│  thread_fn(void*)                512 B          0 B         512 B                                           │
-│ q:quit  f:filter  t:thread  s/S:sort  1/2/3:sort-by  Tab/h/l:pane  j/k:nav  ^f/^b:page  g/G:top/bot       │
+│ ▁▁▂▃▅▇▇▆▃▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ 1.234s              │
+├──────────────────────────────────────────────────────────────┬────────────────────────────────────────────┤
+│ St. Pointer             Op        Time        Size      Thread│ Detail [↑↓ scroll]                         │
+│ [L] 0x7f4860000880      realloc   0.267ms     512 B     w-1  │ ── Allocation ──────────────────────────── │
+│ [A] 0x55b29f0a8160      malloc    0.376ms     128 B     w-2  │   Op      : realloc                        │
+│                                                              │   Ptr     : 0x7f4860000880                  │
+│                                                              │   Size    : 512 B                           │
+├──────────────────────────────────────────────────────────────┴────────────────────────────────────────────┤
+│ Thread       TID    Allocated    Freed     Net(live)  Leaks                                                │
+│ worker-1     12346  640 B        0 B       640 B      1 (512 B)                                           │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Status column:** `[L]` = leak, `[A]` = active (not yet freed), `[F]` = freed
+**Row colours in the list:**
+- **Green** — live allocation, recently created (last 30% of session)
+- **Yellow** — live allocation, middle-aged (30–75% of session)
+- **Red/bold** — live allocation, old (oldest 75%+) — most likely a leak
+- **Yellow/dim** — freed allocation
+- **Red/bold** — confirmed leak (`[L]`)
 
-The **left pane is a fixed 72 columns** wide (exactly enough for all list columns) so the detail pane always receives the maximum available space.
+**Status column:** `[L]` = leak, `[A]` = active (not freed), `[F]` = freed
 
-The detail pane shows **Time** (when the allocation occurred) and, for freed allocations, **Lifetime** (how long the pointer was live).
+### Timeline row
 
-### Threads pane
+Row 3 of the header shows a **sparkline timeline** of live memory over the session:
 
-The threads pane (below the main list) shows one row per thread with these columns:
-
-| Column      | Description |
-|-------------|-------------|
-| `Thread`    | Thread name (up to 15 chars) |
-| `TID`       | Linux thread ID |
-| `Allocated` | Total bytes ever allocated by this thread |
-| `Freed`     | Total bytes freed (including cross-thread frees) |
-| `Net(live)` | `Allocated − Freed` — bytes currently live |
-| `Leaks`     | Number and total size of allocations logged as LEAK at exit (cancelled when later freed by another thread) |
-
-Rows are sorted by `Net(live)` descending by default. The currently selected thread (active filter) is highlighted bold. Press `t`/`T` to cycle the thread filter forward/backward, which affects both the main list and the thread summary pane.
+- Each cell = a time bucket; height represents cumulative live bytes at that point
+- **Green** cells = net allocating period; **yellow** = net freeing period
+- When a **thread filter** is active, only that thread's allocations are shown (same time axis, labelled with the thread name)
+- Persistent **markers** (magenta digits `1`–`9`) are shown at their placed timestamps
+- Range brackets `[` `]` mark the active range diff window
+- Delta baseline `|` shown in yellow when delta mode is active
+- Press **`Z`** to hide/show the timeline row
 
 ### Keys
 
 | Key | Action |
 |-----|--------|
-| `↑` `↓` / `k` `j` | Navigate allocation list (or scroll active pane when focused) |
+| `↑` `↓` / `k` `j` | Navigate allocation list |
 | `PgUp` `PgDn` / `Ctrl-b` `Ctrl-f` | Scroll by page |
 | `Home` `End` / `g` `G` | Jump to top / bottom |
 | `Tab` / `→` / `l` | Cycle focus forward: **list → detail → thread summary → list** |
 | `←` / `h` | Cycle focus backward |
 | `f` | Cycle filter: **All → Leaks → Active → Freed** |
-| `a` | Set minimum lifetime filter — prompts for seconds (`0` = off). Only allocations older than the threshold are shown. Active filter shown in header as `Age≥N`. |
-| `/` | Symbol search — prompts for a substring matched case-insensitively against stack frames, thread name, op, and pointer address. Empty input clears. Active search shown in header as `Search: foo`. |
-| `m` | Toggle **delta mode** — first press snapshots the current timestamp; only allocations that appear *after* the mark are shown. Header shows `▶ DELTA since T` in yellow. Press again to clear. |
-| `\` | Toggle **group mode** — folds all visible records with identical stack traces into one row showing count × total bytes + first frame. Press again or `Enter` to expand. |
-| `Enter` | In normal mode: jump to the group containing the selected record. In group mode: expand back to the individual record. |
+| `a` | Minimum lifetime filter — prompts for seconds (`0` = off). Shown in header as `Age≥N`. |
+| `/` | Symbol search — case-insensitive substring across frames, thread name, op, pointer. Empty clears. |
+| `m` | **Delta mode** — marks the selected record's timestamp; shows only what was allocated after. Header shows `▶ DELTA since T`. Press again to clear. |
+| `M` | **Add marker** — drops a numbered marker (M1–M9) at the selected record's timestamp. Shown as magenta digit on timeline. |
+| `D` | **Delete marker** — removes the marker nearest to the selected record. |
+| `[` | **Range start** — sets the range filter start at the selected record's time (snaps to nearest marker). |
+| `]` | **Range end** — sets the range filter end. When both ends are set, only allocations in that window are shown. Header shows `▶◀ RANGE`. |
+| `R` | **Clear range** — removes range filter (markers remain). |
+| `\` | Toggle **group mode** — folds records with identical stack traces. |
+| `Enter` | Normal mode: jump to the group containing the selected record. Group mode: jump back to the example record. |
 | `t` / `T` | Cycle thread filter forward / backward |
-| `s` | Cycle sort column (list pane: **Time → Size → Thread**; group mode: **Total → Count**; thread summary pane: **Name → TID → Allocated → Freed → Net(live) → Leaks**) |
+| `s` | Cycle sort column. List: **Time → Size → Thread**. Group: **Total → Count → Rate**. Threads: **Name → TID → Allocated → Freed → Net → Leaks**. |
 | `S` | Reverse current sort direction |
-| `1` / `2` / `3` | Sort by Time / Size / Thread directly (press again to reverse) |
-| `L` | Toggle addr2line source-line resolution in the detail pane |
-| `F` | Toggle auto-follow in live mode (re-enabled by pressing `G`) |
+| `1` / `2` / `3` | Sort by Time / Size / Thread directly |
+| `H` | Toggle **size histogram** — replaces list pane with a bar chart of allocations by size bucket |
+| `W` | **Export** — prompts for a filename and writes visible records (or groups) to a text file |
+| `Z` | Toggle **timeline** row in header |
+| `L` | Toggle addr2line source-line resolution in detail pane |
+| `F` | Toggle auto-follow in live mode |
 | `q` / `Esc` | Quit |
-
-### Live mode (`-f`)
-
-When started with `-f`, `memview` polls the log file every **250 ms** for new lines and updates the display incrementally without disturbing your scroll position. Auto-follow (`F`) keeps the list scrolled to the newest entry.
-
-If the log file is **truncated** (application restarted), the display resets automatically.
-
-Manual navigation (any movement key) **pauses** auto-follow. Pressing `G` jumps to the bottom and **re-enables** it.
-
-The header shows `● LIVE` (green) when auto-follow is on, `◌ LIVE` (yellow/paused) when it is not.
-
-### Thread summary pane
-
-At the bottom of the screen, a pane lists all threads with their allocation statistics. When focused (press **Tab** / `l` to cycle to it), the title shows navigation hints and additional keys become active.
-
-- **`s`** — cycle sort column: **Name → TID → Allocated → Freed → Net(live) → Leaks → Name**
-- **`S`** — toggle reverse sort direction (▲/▼ indicator appears next to the active column)
-- **`j`/`k`**, **`Ctrl-f`/`Ctrl-b`**, **`g`/`G`** — scroll when there are more threads than visible rows
-- A **scroll indicator** (`N-M/total`) appears in the title when scrollable
-
-The active pane title bar is highlighted in **cyan** so it is always clear which pane has keyboard focus.
-
-The pane respects the current **thread filter** (`t`/`T` keys): the filtered thread row is highlighted, and when all threads are selected every row is highlighted.
-
-- For function names to appear in stack traces, compile with `-rdynamic`; inlined functions appear under the caller's name — use `__attribute__((noinline))` on allocating functions for accurate attribution.
 
 ### Group mode (`\`)
 
 Press `\` to fold all visible records with identical stack traces into one row. Each row shows:
 
-- **×N** — number of allocations sharing this call site
-- **Total bytes** — combined size of all those allocations
+- **▲ ×N** — monotonic growth indicator + allocation count. **`▲` in red** means live bytes for this call site *never decrease* — a strong leak signal.
+- **Total bytes** — combined size of all allocations at this call site
+- **Rate/s** — bytes per second (total ÷ time span of the group's allocations). Non-zero when idle = almost certainly leaking.
 - **First frame** (demangled) + thread name
 
-Groups are sorted by total bytes descending by default (worst offenders first). Press `s` to switch to sort by count, `S` to reverse.
+Sort with `s` cycles **Total → Count → Rate**. `S` reverses.
 
-Press **`Enter`** on a group to jump back to the individual records for that group. Press **`Enter`** on an individual record to jump to its group. Press `\` again to leave group mode.
+Press **`Enter`** on a group to jump back to individual records. Press `\` again to leave group mode.
+
+### Size histogram (`H`)
+
+Press `H` to replace the list pane with a bar chart showing the distribution of visible allocations across 10 size buckets (≤16 B → >1 MB). Each bar shows count and total bytes. The chart is filter-aware — it reflects the current filter, search, thread, and range.
+
+### Markers and range diff
+
+Markers are named timestamps (M1–M9) you pin to specific moments in the log. They appear as magenta digits on the timeline sparkline.
+
+**Typical workflow:**
+
+```
+1. Navigate to a baseline record → press M  (drop M1)
+2. Navigate to a later record    → press M  (drop M2)
+3. Navigate near M1 → press [   (set range start, snaps to M1)
+4. Navigate near M2 → press ]   (set range end,   snaps to M2)
+5. List now shows only allocations in that window
+6. Press \ → group by call site, sort by Rate or Total
+7. Press f → Leaks filter to see what didn't get freed
+```
 
 ### Leak analysis workflow
 
-A typical session for finding memory leaks:
-
 1. Run the application under `LD_PRELOAD=./memtrack.so` with `MEMTRACK_OUTPUT=leak.log`
-2. Open `memview leak.log` (or use live mode with `-f` / TCP)
-3. Press **`f`** to switch to the **Leaks** filter
-4. Press **`\`** to enter **group mode** — identical call sites collapse into one row, sorted by total bytes leaked
-5. Navigate to the largest group and press **`Tab`** to see the full stack trace in the detail pane
-6. Use **`/`** to search for a specific function name if you already have a suspect
-7. Use **`a`** to set a minimum age (e.g. `5`) to hide transient allocations and keep only long-lived leaks
-8. In live mode, use **`m`** to mark a point in time — only allocations that appear after the mark are shown, making it easy to isolate what a specific operation leaks
+2. Open `memview leak.log` (or use live mode `-f` / TCP)
+3. Press **`f`** → **Leaks** filter
+4. Press **`\`** → group mode — identical call sites collapse, sorted by total bytes leaked
+5. Look for rows with **`▲`** (monotonic growth) — these are the highest-priority suspects
+6. Navigate to a group and check the **Rate/s** column — non-zero means bytes keep accumulating
+7. Press **`Tab`** to move to the detail pane and inspect the full stack trace
+8. Use **`/`** to search for a specific function, or **`a`** to hide short-lived allocations
+9. Use markers (`M`) and range (`[`/`]`) to isolate what a specific operation leaks
+10. Press **`W`** to export findings to a text file for sharing or diffing
 
 ---
 
 ## Test suite
 
-A comprehensive test application (`test_app`) exercises 22 different scenarios across multiple threads:
+A test application (`test_app`) exercises 24 different scenarios across multiple threads:
 
 | Test | Scenario |
 |------|----------|
@@ -294,38 +260,30 @@ A comprehensive test application (`test_app`) exercises 22 different scenarios a
 | T06  | `realloc` grow (may move pointer) |
 | T07  | `realloc` shrink (likely in-place) |
 | T08  | `realloc(ptr, 0)` acts as `free` |
-| T09  | Five-step realloc chain (100 → 200 → 400 → 800 → final size) |
-| T10  | `free(NULL)` — must be silent, no log entry |
-| T11  | `malloc(0)` — glibc returns non-NULL; handles either behaviour |
+| T09  | Five-step realloc chain |
+| T10  | `free(NULL)` — must be silent |
+| T11  | `malloc(0)` — handles either NULL or non-NULL |
 | T12  | 10 MB large allocation |
 | T13  | 200× `malloc(13)`, all freed |
-| T14  | Intentional leak — verified NOT freed (absence from free log) |
+| T14  | Intentional leak — verified NOT freed |
 | T15  | Cross-thread free while allocating thread is still alive |
-| T16  | LEAK cancellation — thread exits leaving allocation unfreed; main frees it afterwards |
-| T17  | 4 worker threads each exercising all alloc types; all freed |
+| T16  | LEAK cancellation — thread exits; main frees afterwards |
+| T17  | 4 worker threads, all alloc types, all freed |
 | T18  | C++14 sized `::operator delete(ptr, n)` |
-| T19  | Failed `realloc` safety — original pointer remains valid and is freed |
-| T20  | 20-level deep call stack — stack capture and log integrity |
-| T21  | 60-level template recursion — long symbol names trigger heap buffer path in `write_event` |
-| T22  | `MEMTRACK_STACK_THREADS` filter — frames captured only for matching threads |
-| T23  | `strdup` / `strndup` — intercepted with their own op names, freed cleanly |
+| T19  | Failed `realloc` safety — original pointer remains valid |
+| T20  | 20-level deep call stack |
+| T21  | 60-level template recursion — long symbol names |
+| T22  | `MEMTRACK_STACK_THREADS` filter |
+| T23  | `strdup` / `strndup` — own op names, freed cleanly |
+| T24  | Anonymous `mmap` / `munmap` — tracked and balanced |
 
-Each test uses a unique size encoding (`T×1000+N`) so any allocation can be located by a simple `grep` in the log.
-
-Run the suite and verify automatically:
+Run the suite:
 
 ```sh
 make test
 ```
 
-This builds `memtrack.so` and `test_app`, runs the app under `LD_PRELOAD`, captures the log to `mt.log`, and runs `verify.sh` which checks **51 assertions** and reports per-test PASS/FAIL.
-
-You can also run the verification manually:
-
-```sh
-LD_PRELOAD=./memtrack.so ./test_app 2>mt.log
-./verify.sh mt.log
-```
+This builds all targets, runs the app under `LD_PRELOAD`, captures the log to `mt.log`, and runs `verify.sh` which checks **53 assertions** and reports per-test PASS/FAIL.
 
 ---
 
@@ -333,49 +291,30 @@ LD_PRELOAD=./memtrack.so ./test_app 2>mt.log
 
 memtrack is a debugging tool; its overhead is significant and it is **not intended for production use**.
 
-### Per-operation CPU cost
+| Source | Cost |
+|--------|------|
+| `pthread_mutex_lock/unlock` | **High** — per-thread lock on allocation path; free path is lock-free |
+| `write()` syscall | **High** — one per allocation and one per free |
+| `clock_gettime(CLOCK_MONOTONIC)` | Medium — one call per event |
+| `backtrace()` | **Very high** if enabled — 10–100 µs per call; disabled by default |
 
-| Source | Cost | Notes |
-|--------|------|-------|
-| `pthread_mutex_lock/unlock` | **High** | Per-thread lock on allocation path; free path is **lock-free** |
-| `write()` syscall | **High** | One per allocation and one per free to write the log line |
-| `clock_gettime(CLOCK_MONOTONIC)` | Medium | One syscall per event for the timestamp |
-| `syscall(SYS_gettid)` | Medium | Called on every allocation (not cached) |
-| `backtrace()` | **Very high** (if enabled) | 10–100 µs per call depending on stack depth; disabled by default |
-| `backtrace_symbols()` | **Very high** (if enabled) | Demangling is done in memview, not memtrack |
+**Typical slowdown** (stack traces off): **1.5–3×**. With `MEMTRACK_STACK_DEPTH=5`: **50–100×**.
 
-**Typical slowdown** (stack traces off): **1.5–3×** — two `write()` syscalls and two `clock_gettime` calls per alloc/free pair. The free hook is completely lock-free: it does one `clock_gettime`, one `snprintf` into a stack buffer, and one `write()`.
-
-With `MEMTRACK_STACK_DEPTH=5` the slowdown can reach **50–100×**.
-
-### Memory overhead
-
-**Zero per-allocation heap overhead** — no in-memory map is kept. memtrack writes each event directly to the log and forgets it. Resident memory cost is limited to the file write buffer (~4 KB, kernel-managed) plus a few hundred bytes of per-thread state. Use `MEMTRACK_MIN_SIZE` to further reduce log volume for size-filtered workloads.
+**Zero per-allocation heap overhead** — no in-memory map is kept. memtrack writes each event directly to the log and forgets it.
 
 ---
 
 ## Implementation notes
 
-- **Bootstrap allocator** — `dlsym()` itself calls `calloc` during startup before the real function pointers are resolved. A static 64 KB buffer handles those early allocations safely.
-
-- **`in_hook` (thread-local bool)** — set to `true` for the entire duration of any hook or internal helper (`log_alloc`, `log_free_capture`, `print_frames`, `thread_exit_handler`). This prevents recursive hook calls and ensures that internal allocations (e.g. from `backtrace_symbols`) are never tracked.
-
-- **Lock-free free path** — the alloc path takes a per-thread mutex (to serialise the `write()` call for multi-line alloc+frames output). The free path is entirely lock-free: one `clock_gettime`, one `snprintf`, one `write()`. Leak detection is delegated entirely to memview, which reconstructs the alloc/free lifecycle from the log by matching `ptr=` fields with line-number awareness to handle address reuse.
-
-- **`pthread_key` destructor** — `thread_exit_handler` is registered via `pthread_key_create`. On thread exit it emits an EXIT line and returns. memview scans all still-unfreed records for the exiting thread and marks them as leaked.
-
-- **Cross-thread LEAK cancellation** — memview handles this entirely by comparing log line numbers. When a free appears after an EXIT for the same pointer, memview clears the `is_leak` flag and decrements the thread's leak counters.
-
-- **Timestamps** — `clock_gettime(CLOCK_MONOTONIC)` is captured in `memtrack_ctor()` as the zero point. Each event records microseconds elapsed since that point. Allocations before the constructor fires (early runtime init) are recorded with `ts=0`.
-
-- **Stack traces & demangling** — `backtrace()` is called skipping two internal frames (the hook + `log_alloc`/`log_free`) so `#0` is always user code. Symbols are emitted raw (mangled); memview demandles them on display using `abi::__cxa_demangle`.
-
-- **`write()` for output** — uses the `write(2)` syscall directly instead of `printf`/`fprintf` to avoid stdio buffering and re-entrant allocation inside the hook.
-
-- **GCC dead-allocation elimination** — at `-O2`, GCC may prove that an allocation result escapes only into `free()` and eliminate the alloc/free pair entirely ("as-if" rule + `__attribute__((malloc))`). `test_app` is compiled at `-O0` to prevent this.
+- **Bootstrap allocator** — `dlsym()` itself calls `calloc` during startup. A static 64 KB buffer handles those early allocations safely.
+- **`in_hook` (thread-local bool)** — prevents recursive hook calls and ensures internal allocations (e.g. from `backtrace_symbols`) are never tracked.
+- **Lock-free free path** — the alloc path takes a per-thread mutex (to serialise multi-line alloc+frames output). The free/munmap path is entirely lock-free.
+- **`mmap` tracking** — only `MAP_ANONYMOUS` mappings are tracked; file-backed mmaps are skipped to avoid noise. `mremap` is logged as free(old) + alloc(new) to keep the tracker balanced.
+- **`pthread_key` destructor** — `thread_exit_handler` is registered via `pthread_key_create`. On thread exit it emits an EXIT line; memview marks still-unfreed records as leaked.
+- **Cross-thread LEAK cancellation** — handled in memview by log line numbers. When a free appears after an EXIT for the same pointer, memview clears the `is_leak` flag.
 
 ## Limitations
 
-- `posix_memalign`, `aligned_alloc`, `memalign`, `valloc`, `strdup`, and `strndup` are not intercepted.
-- The leak report only fires on *thread exit* (via `pthread_key` destructor). If the process is killed with `SIGKILL`, exit reports are not printed. memview handles this by marking all still-unfreed allocations as leaked at EOF.
+- `posix_memalign`, `aligned_alloc`, `memalign`, `valloc`, and `reallocarray` are not intercepted.
+- The leak report only fires on *thread exit*. If the process is killed with `SIGKILL`, exit reports are not printed; memview handles this by marking all still-unfreed allocations as leaked at EOF.
 - Not intended for production use — see [Overhead](#overhead) above.
