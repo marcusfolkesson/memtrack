@@ -491,10 +491,15 @@ struct LeakGroup {
     vector<string> frames;       // frames from the example record
     string         op;           // op from example record
     string         thread_name;  // set if all records share the same thread
-    int            tid    = -1;  // set if all records share the same thread
-    size_t         count      = 0;
+    int            tid       = -1;
+    size_t         count     = 0;
     size_t         total_size = 0;
     size_t         example_idx = 0;  // index into ps->records (for detail pane)
+    // Growth analysis (computed in rebuild_groups)
+    bool           monotonic_growth = false; // live bytes only ever increase
+    uint64_t       min_ts = UINT64_MAX;      // earliest alloc in group
+    uint64_t       max_ts = 0;               // latest alloc in group
+    double         bytes_per_sec = 0.0;      // allocation rate
 };
 
 enum FilterMode { F_ALL, F_LEAKS, F_ACTIVE, F_FREED, F_COUNT };
@@ -505,7 +510,7 @@ static const char* sort_label[]   = { "Time", "Size↕", "Thread" };
 
 
 enum ThreadSortMode { TS_NET, TS_NAME, TS_TID, TS_ALLOC, TS_FREED, TS_LEAKS };
-enum GroupSortMode  { GS_TOTAL, GS_COUNT };  // sort modes for group view
+enum GroupSortMode  { GS_TOTAL, GS_COUNT, GS_RATE };  // sort modes for group view
 
 struct UI {
     ParseState*    ps           = nullptr;
@@ -534,6 +539,7 @@ struct UI {
     bool           delta_mode  = false;      // show only allocations after mark_ts
     uint64_t       mark_ts     = 0;          // timestamp of mark point (µs)
     bool           show_timeline = true;     // show sparkline timeline in header
+    bool           hist_mode    = false;     // show size-distribution histogram
 
     // Persistent timeline markers (M key)
     struct Marker { uint64_t ts; int id; };  // id = 1..9
@@ -727,7 +733,6 @@ struct UI {
 
         for (size_t vi : visible) {
             const auto& r = ps->records[vi];
-            // Key: concatenated frames, or "op:<name>" if no frames available
             string key;
             if (!r.frames.empty()) {
                 for (const auto& f : r.frames) { key += f; key += '\n'; }
@@ -747,21 +752,64 @@ struct UI {
                 g.count       = 1;
                 g.total_size  = r.size;
                 g.example_idx = vi;
+                g.min_ts      = r.timestamp_us;
+                g.max_ts      = r.timestamp_us;
                 groups.push_back(std::move(g));
             } else {
                 auto& g = groups[it->second];
                 g.count++;
                 g.total_size += r.size;
                 if (g.tid != r.tid) { g.tid = -1; g.thread_name = ""; }
+                g.min_ts = min(g.min_ts, r.timestamp_us);
+                g.max_ts = max(g.max_ts, r.timestamp_us);
             }
+        }
+
+        // Post-process: compute monotonic growth and bytes_per_sec.
+        // Monotonic growth: sort the group's records by time and check that
+        // running net bytes (alloc - free) never decreases.
+        for (auto& g : groups) {
+            // Collect (ts, delta) events for this group
+            vector<pair<uint64_t,int64_t>> events;
+            for (size_t vi : visible) {
+                const auto& r = ps->records[vi];
+                // Check membership by key
+                string key;
+                if (!r.frames.empty()) {
+                    for (const auto& f : r.frames) { key += f; key += '\n'; }
+                } else { key = "op:" + r.op; }
+                if (key != g.key) continue;
+                events.push_back({r.timestamp_us, (int64_t)r.size});
+                if (r.freed) events.push_back({r.free_timestamp_us, -(int64_t)r.size});
+            }
+            std::sort(events.begin(), events.end());
+            int64_t net = 0, prev_net = 0;
+            bool monotonic = true;
+            for (auto& [ts, delta] : events) {
+                net += delta;
+                if (net < prev_net) { monotonic = false; break; }
+                prev_net = net;
+            }
+            // Only flag as monotonic if there are enough samples and it's live
+            g.monotonic_growth = monotonic && g.count >= 2 && net > 0;
+
+            // Rate: total bytes allocated divided by time span
+            uint64_t span_us = (g.max_ts > g.min_ts) ? (g.max_ts - g.min_ts) : 0;
+            g.bytes_per_sec  = (span_us > 0)
+                               ? (double)g.total_size / ((double)span_us / 1e6)
+                               : 0.0;
         }
 
         // Sort by active group sort mode
         std::stable_sort(groups.begin(), groups.end(),
             [this](const LeakGroup& a, const LeakGroup& b) {
-                bool less = (group_sort == GS_COUNT)
-                    ? (a.count > b.count)
-                    : (a.total_size > b.total_size);
+                bool less;
+                if (group_sort == GS_COUNT)
+                    less = a.count > b.count;
+                else if (group_sort == GS_RATE)
+                    less = a.bytes_per_sec > b.bytes_per_sec;
+                else
+                    less = a.total_size > b.total_size;
                 return group_sort_rev ? !less : less;
             });
 
@@ -1061,9 +1109,11 @@ static void draw_list(WINDOW* w, const UI& ui)
                 for (int i = label_len; i < pad; i++) waddch(w, ' ');
             }
         };
-        gcol("×Count", GS_COUNT, 9);  // 8 chars + 1 space
+        gcol("×Count", GS_COUNT, 9);
         waddstr(w, "  ");
         gcol("Total", GS_TOTAL, 10);
+        waddstr(w, "  ");
+        gcol("Rate/s", GS_RATE, 10);
         waddstr(w, "  Description");
         hline_to_eol(w, 0, hdr_cp);
         wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
@@ -1102,15 +1152,20 @@ static void draw_list(WINDOW* w, const UI& ui)
                 ? ("  [" + g.thread_name + "]")
                 : "  [multiple threads]";
 
-            int cp   = C_GROUP;
+            int cp   = g.monotonic_growth ? C_LEAK : C_GROUP;
             attr_t attr = A_BOLD;
             if (sel && !ui.focus_detail && !ui.focus_threads) { cp = C_SEL; attr = A_BOLD; }
 
             wattron(w, COLOR_PAIR(cp) | attr);
-            char count_buf[16], size_buf[12];
-            snprintf(count_buf, sizeof(count_buf), "×%zu", g.count);
-            snprintf(size_buf,  sizeof(size_buf),  "%s", fmt_size(g.total_size).c_str());
-            mvwprintw(w, row + 1, 0, " [G] %8s  %-10s  ", count_buf, size_buf);
+            char count_buf[16], size_buf[12], rate_buf[12];
+            snprintf(count_buf, sizeof(count_buf), "%s×%zu",
+                     g.monotonic_growth ? "▲" : " ", g.count);
+            snprintf(size_buf, sizeof(size_buf), "%s", fmt_size(g.total_size).c_str());
+            if (g.bytes_per_sec >= 1.0)
+                snprintf(rate_buf, sizeof(rate_buf), "%s/s", fmt_size((size_t)g.bytes_per_sec).c_str());
+            else
+                snprintf(rate_buf, sizeof(rate_buf), "-");
+            mvwprintw(w, row + 1, 0, " [G] %9s  %-10s  %-10s  ", count_buf, size_buf, rate_buf);
 
             // Fill remaining width with truncated description + thread info
             int used = getcurx(w);
@@ -1165,6 +1220,16 @@ static void draw_list(WINDOW* w, const UI& ui)
     wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
 
     int list_rows = rows - 2;   // -1 header -1 counter
+
+    // Compute session time span for age colouring of live allocations
+    uint64_t age_max_ts = 0, age_min_ts = UINT64_MAX;
+    for (const auto& r : ui.ps->records) {
+        age_min_ts = min(age_min_ts, r.timestamp_us);
+        age_max_ts = max(age_max_ts, r.timestamp_us);
+        if (r.freed) age_max_ts = max(age_max_ts, r.free_timestamp_us);
+    }
+    uint64_t age_span = (age_max_ts > age_min_ts) ? (age_max_ts - age_min_ts) : 1;
+
     for (int row = 0; row < list_rows; row++) {
         int idx = ui.list_top + row;
         if (idx >= (int)ui.visible.size()) break;
@@ -1178,10 +1243,22 @@ static void draw_list(WINDOW* w, const UI& ui)
 
         string sz = fmt_size(r.size);
 
-        int cp = r.is_leak ? C_LEAK : (r.freed ? C_FREE : C_ALLOC);
-        if (sel && !ui.focus_detail && !ui.focus_threads) cp = C_SEL;
-        attr_t attr = (sel && !ui.focus_detail && !ui.focus_threads) ? A_BOLD : 0;
-        if (r.is_leak) attr |= A_BOLD;
+        int cp;
+        attr_t attr = 0;
+        if (sel && !ui.focus_detail && !ui.focus_threads) {
+            cp = C_SEL; attr = A_BOLD;
+        } else if (r.is_leak) {
+            cp = C_LEAK; attr = A_BOLD;
+        } else if (r.freed) {
+            cp = C_FREE;
+        } else {
+            // Live allocation: colour by age (young→normal, middle→yellow, old→red)
+            uint64_t age = (age_max_ts >= r.timestamp_us) ? (age_max_ts - r.timestamp_us) : 0;
+            int age_pct = (int)(age * 100 / age_span);
+            if      (age_pct >= 75) { cp = C_LEAK;   attr = A_BOLD; }  // old: red
+            else if (age_pct >= 30) { cp = C_FREE;   attr = 0;      }  // mid: yellow
+            else                    { cp = C_ALLOC;  attr = 0;      }  // young: green
+        }
 
         wattron(w, COLOR_PAIR(cp) | attr);
         mvwprintw(w, row + 1, 0, " [%c] %-18s %-9s %-12s %-9s %-15s",
