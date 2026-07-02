@@ -213,9 +213,12 @@ static void parse_line(const char* line, ParseState& st)
             auto& old_rec = st.records[existing->second];
             if (!old_rec.freed) {
                 old_rec.freed = true;
-                // Don't penalise the thread's freed counter — the real free
-                // event will arrive later and would double-credit otherwise.
-                // Just ensure the record isn't flagged as a leak.
+                // Credit the retired bytes to keep net() consistent with the
+                // active-allocation list. The delayed free event (which caused
+                // the out-of-order situation) will arrive later and match the
+                // NEW ptr_idx entry, not this old one, so there is no
+                // double-counting.
+                st.thread(old_rec.tid, old_rec.thread_name).freed += old_rec.size;
             }
         }
 
