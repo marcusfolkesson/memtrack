@@ -41,6 +41,7 @@
 using std::vector;
 using std::string;
 using std::unordered_map;
+using std::pair;
 using std::min;
 using std::max;
 
@@ -730,6 +731,8 @@ struct UI {
     {
         groups.clear();
         std::unordered_map<string, size_t> key_idx;
+        // Collect timestamped net-byte events per group in one pass.
+        std::unordered_map<string, vector<pair<uint64_t,int64_t>>> events_map;
 
         for (size_t vi : visible) {
             const auto& r = ps->records[vi];
@@ -763,44 +766,34 @@ struct UI {
                 g.min_ts = min(g.min_ts, r.timestamp_us);
                 g.max_ts = max(g.max_ts, r.timestamp_us);
             }
+
+            // Accumulate events for monotonic growth check (alloc + optional free)
+            auto& evs = events_map[key];
+            evs.push_back({r.timestamp_us, (int64_t)r.size});
+            if (r.freed)
+                evs.push_back({r.free_timestamp_us, -(int64_t)r.size});
         }
 
-        // Post-process: compute monotonic growth and bytes_per_sec.
-        // Monotonic growth: sort the group's records by time and check that
-        // running net bytes (alloc - free) never decreases.
+        // Post-process: monotonic growth and rate — O(n log n) total
         for (auto& g : groups) {
-            // Collect (ts, delta) events for this group
-            vector<pair<uint64_t,int64_t>> events;
-            for (size_t vi : visible) {
-                const auto& r = ps->records[vi];
-                // Check membership by key
-                string key;
-                if (!r.frames.empty()) {
-                    for (const auto& f : r.frames) { key += f; key += '\n'; }
-                } else { key = "op:" + r.op; }
-                if (key != g.key) continue;
-                events.push_back({r.timestamp_us, (int64_t)r.size});
-                if (r.freed) events.push_back({r.free_timestamp_us, -(int64_t)r.size});
-            }
-            std::sort(events.begin(), events.end());
+            auto& evs = events_map[g.key];
+            std::sort(evs.begin(), evs.end());
             int64_t net = 0, prev_net = 0;
             bool monotonic = true;
-            for (auto& [ts, delta] : events) {
+            for (auto& [ts, delta] : evs) {
                 net += delta;
                 if (net < prev_net) { monotonic = false; break; }
                 prev_net = net;
             }
-            // Only flag as monotonic if there are enough samples and it's live
             g.monotonic_growth = monotonic && g.count >= 2 && net > 0;
 
-            // Rate: total bytes allocated divided by time span
             uint64_t span_us = (g.max_ts > g.min_ts) ? (g.max_ts - g.min_ts) : 0;
             g.bytes_per_sec  = (span_us > 0)
                                ? (double)g.total_size / ((double)span_us / 1e6)
                                : 0.0;
         }
 
-        // Sort by active group sort mode
+        // Sort
         std::stable_sort(groups.begin(), groups.end(),
             [this](const LeakGroup& a, const LeakGroup& b) {
                 bool less;
@@ -1077,6 +1070,87 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
         hline_to_eol(w, 2, C_NORMAL);
     }
 
+    wrefresh(w);
+}
+
+// ─── Draw: size histogram ────────────────────────────────────────────────────
+
+static void draw_histogram(WINDOW* w, const UI& ui)
+{
+    int rows, cols; getmaxyx(w, rows, cols);
+    werase(w);
+
+    bool focused = !ui.focus_detail && !ui.focus_threads;
+    int hdr_cp = focused ? C_FOCUS_HDR : C_HEADER;
+    wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
+    mvwaddstr(w, 0, 0, " [H] Size distribution  (visible records)");
+    hline_to_eol(w, 0, hdr_cp);
+    wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
+
+    // Size buckets: upper bound (inclusive), label
+    struct Bucket { size_t limit; const char* label; };
+    static const Bucket buckets[] = {
+        {        16, "     ≤16 B " },
+        {        64, "     ≤64 B " },
+        {       256, "    ≤256 B " },
+        {      1024, "      ≤1 KB" },
+        {   4*1024,  "      ≤4 KB" },
+        {  16*1024,  "     ≤16 KB" },
+        {  64*1024,  "     ≤64 KB" },
+        { 256*1024,  "    ≤256 KB" },
+        {1024*1024,  "      ≤1 MB" },
+        { SIZE_MAX,  "      >1 MB" },
+    };
+    constexpr int NBUCKETS = 10;
+
+    size_t count[NBUCKETS] = {};
+    size_t bytes[NBUCKETS] = {};
+
+    for (size_t vi : ui.visible) {
+        const auto& r = ui.ps->records[vi];
+        for (int b = 0; b < NBUCKETS; b++) {
+            if (r.size <= buckets[b].limit) {
+                count[b]++;
+                bytes[b] += r.size;
+                break;
+            }
+        }
+    }
+
+    size_t max_count = 1;
+    for (int b = 0; b < NBUCKETS; b++) max_count = max(max_count, count[b]);
+
+    // Bar area: cols - label(11) - count(8) - bytes(12) - 4 padding
+    int bar_w = max(4, cols - 11 - 8 - 12 - 4);
+
+    int body_rows = rows - 2;  // header + footer
+    for (int b = 0; b < NBUCKETS && b < body_rows; b++) {
+        int bar_len = (int)((uint64_t)count[b] * bar_w / max_count);
+
+        // Colour by size class: small=green, medium=yellow, large=red
+        int cp = (b <= 3) ? C_ALLOC : (b <= 6) ? C_FREE : C_LEAK;
+
+        wattron(w, COLOR_PAIR(C_DIM));
+        mvwprintw(w, b + 1, 0, "%s", buckets[b].label);
+        wattroff(w, COLOR_PAIR(C_DIM));
+
+        wattron(w, COLOR_PAIR(cp) | A_BOLD);
+        for (int i = 0; i < bar_len; i++) waddch(w, ACS_CKBOARD);
+        wattroff(w, COLOR_PAIR(cp) | A_BOLD);
+
+        if (count[b] > 0) {
+            wattron(w, COLOR_PAIR(C_NORMAL));
+            wprintw(w, "  %6zu  %s", count[b], fmt_size(bytes[b]).c_str());
+            wattroff(w, COLOR_PAIR(C_NORMAL));
+        }
+    }
+
+    // Footer
+    wattron(w, COLOR_PAIR(C_DIM) | A_DIM);
+    mvwprintw(w, rows - 1, 0, " %zu records  H:close histogram",
+              ui.visible.size());
+    hline_to_eol(w, rows - 1, C_DIM);
+    wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
     wrefresh(w);
 }
 
@@ -1595,7 +1669,7 @@ static void draw_status(WINDOW* w, const UI& ui)
                   " s/S:sort(rev)  j/k:scroll  g/G:top/bot  ^f/^b:page  Tab:next-pane  q:quit");
     else
         mvwprintw(w, 0, 0,
-                  " q:quit  f:filter  a:age  /:search  m:mark  M:marker  D:del-marker  [/]:range  R:clr-range  W:export  Z:timeline  t/T:thread  s/S:sort  Tab/h/l:pane  j/k:nav  L:src%s",
+                  " q:quit  f:filter  a:age  /:search  m:mark  M:marker  D:del-marker  [/]:range  R:clr-range  W:export  H:histogram  Z:timeline  t/T:thread  s/S:sort  Tab/h/l:pane  j/k:nav  L:src%s",
                   ui.live ? "  F:follow" : "");
     hline_to_eol(w, 0, C_DIM);
     wattroff(w, COLOR_PAIR(C_DIM) | A_DIM);
@@ -1938,7 +2012,10 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
         attroff(COLOR_PAIR(C_DIM) | A_DIM);
         refresh();
         draw_header(win.header, ui, filename, reader);
-        draw_list(win.list, ui);
+        if (ui.hist_mode)
+            draw_histogram(win.list, ui);
+        else
+            draw_list(win.list, ui);
         draw_detail(win.detail, ui);
         draw_threads(win.threads, ui);
         draw_status(win.status, ui);
@@ -2172,6 +2249,12 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
             goto next_draw;
         }
 
+        // Toggle size histogram in list pane
+        if (ch == 'H') {
+            ui.hist_mode = !ui.hist_mode;
+            goto next_draw;
+        }
+
         // ── Persistent markers & range diff ──────────────────────────────
 
         // M: add marker at selected record's timestamp
@@ -2298,8 +2381,10 @@ static void run(ParseState& ps, const string& filename, bool live, LiveReader* r
                 ui.rebuild();
             } else if (ch == 's') {
                 if (ui.group_mode) {
-                    // Cycle group sort: Total → Count → Total
-                    ui.group_sort = (ui.group_sort == GS_TOTAL) ? GS_COUNT : GS_TOTAL;
+                    // Cycle group sort: Total → Count → Rate → Total
+                    if      (ui.group_sort == GS_TOTAL) ui.group_sort = GS_COUNT;
+                    else if (ui.group_sort == GS_COUNT) ui.group_sort = GS_RATE;
+                    else                                ui.group_sort = GS_TOTAL;
                     ui.group_sort_rev = false;
                     ui.rebuild_groups();
                 } else {
