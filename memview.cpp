@@ -921,6 +921,8 @@ static void hline_to_eol(WINDOW* w, int y, int col_pair)
 
 // ─── Draw: header ────────────────────────────────────────────────────────────
 
+static string demangle_frame(const string&);  // forward decl (defined below)
+
 static void draw_header(WINDOW* w, const UI& ui, const string& filename,
                         const LiveReader* reader = nullptr)
 {
@@ -1021,13 +1023,14 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
         string left_label;
         int bar_x = 1;
         if (tl_grp) {
-            // Show first frame (truncated) or op as the label
+            // Show first frame (demangled, truncated) or op as the label
             const string& desc = tl_grp->frames.empty() ? tl_grp->op : tl_grp->frames[0];
-            // strip module(sym+off) → just sym, up to 20 chars
-            auto lp = desc.find('('), rp = desc.find(')');
+            string demangled = demangle_frame(desc);
+            // strip module(sym+off) [addr] → just sym
+            auto lp = demangled.find('('), rp = demangled.find(')');
             string sym = (lp != string::npos && rp > lp)
-                         ? desc.substr(lp + 1, rp - lp - 1) : desc;
-            auto plus = sym.find('+');
+                         ? demangled.substr(lp + 1, rp - lp - 1) : demangled;
+            auto plus = sym.rfind('+');
             if (plus != string::npos) sym = sym.substr(0, plus);
             if (sym.size() > 20) sym = sym.substr(0, 19) + "…";
             left_label = " [G:" + sym + "] ";
