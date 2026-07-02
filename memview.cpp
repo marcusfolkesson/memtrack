@@ -68,6 +68,7 @@ struct AllocRecord {
     vector<string> free_frames;
 
     bool   is_leak        = false;  // flagged in a LEAK line at thread exit
+    mutable string cached_key;      // lazily computed group key; cleared on frame addition
 };
 
 struct ThreadInfo {
@@ -131,9 +132,11 @@ static void parse_line(const char* line, ParseState& st)
         while (*p && *p != ' ') p++;  // skip number
         while (*p == ' ') p++;
         string sym = rtrim(p);
-        if (st.last == ParseState::Last::ALLOC && st.last_rec < st.records.size())
-            st.records[st.last_rec].frames.push_back(sym);
-        else if (st.last == ParseState::Last::FREE && st.last_rec < st.records.size())
+        if (st.last == ParseState::Last::ALLOC && st.last_rec < st.records.size()) {
+            auto& rec = st.records[st.last_rec];
+            rec.frames.push_back(sym);
+            rec.cached_key.clear();  // invalidate so key is recomputed with full stack
+        } else if (st.last == ParseState::Last::FREE && st.last_rec < st.records.size())
             st.records[st.last_rec].free_frames.push_back(sym);
         return;
     }
@@ -506,6 +509,9 @@ struct LeakGroup {
     // Unfiltered totals (computed from all records, tid-filter only)
     size_t         all_count   = 0;  // total allocations from this site
     size_t         all_freed   = 0;  // how many were freed (not leaked)
+    // Pre-computed free sites (sorted desc by count); avoids per-render scan
+    vector<pair<size_t, vector<string>>> free_sites;  // {count, frames}
+    size_t         not_freed_total = 0;               // leaked + still live
 };
 
 enum FilterMode { F_ALL, F_LEAKS, F_ACTIVE, F_FREED, F_COUNT };
@@ -712,14 +718,16 @@ struct UI {
         if (group_mode) rebuild_groups();
     }
 
-    // Compute the grouping key for a single record (same logic as rebuild_groups).
-    static string group_key(const AllocRecord& r) {
-        if (!r.frames.empty()) {
-            string k;
-            for (const auto& f : r.frames) { k += f; k += '\n'; }
-            return k;
+    // Returns the grouping key, computing and caching it on first call.
+    static const string& group_key(const AllocRecord& r) {
+        if (r.cached_key.empty()) {
+            if (!r.frames.empty()) {
+                for (const auto& f : r.frames) { r.cached_key += f; r.cached_key += '\n'; }
+            } else {
+                r.cached_key = "op:" + r.op;
+            }
         }
-        return "op:" + r.op;
+        return r.cached_key;
     }
 
     // Switch to group mode and select the group that contains the given record.
@@ -742,19 +750,11 @@ struct UI {
     {
         groups.clear();
         std::unordered_map<string, size_t> key_idx;
-        // Collect timestamped net-byte events per group in one pass.
         std::unordered_map<string, vector<pair<uint64_t,int64_t>>> events_map;
-        // Unique free call stacks per group (joined frames string → sentinel).
-        std::unordered_map<string, std::unordered_map<string,int>> free_paths_map;
 
         for (size_t vi : visible) {
+            const string& key = group_key(ps->records[vi]);
             const auto& r = ps->records[vi];
-            string key;
-            if (!r.frames.empty()) {
-                for (const auto& f : r.frames) { key += f; key += '\n'; }
-            } else {
-                key = "op:" + r.op;
-            }
 
             auto it = key_idx.find(key);
             if (it == key_idx.end()) {
@@ -780,16 +780,10 @@ struct UI {
                 g.max_ts = max(g.max_ts, r.timestamp_us);
             }
 
-            // Accumulate events for monotonic growth check (alloc + optional free)
             auto& evs = events_map[key];
             evs.push_back({r.timestamp_us, (int64_t)r.size});
-            if (r.freed) {
+            if (r.freed)
                 evs.push_back({r.free_timestamp_us, -(int64_t)r.size});
-                // Track unique free call stacks
-                string fkey;
-                for (const auto& f : r.free_frames) { fkey += f; fkey += '\n'; }
-                free_paths_map[key][fkey] = 1;
-            }
         }
 
         // Post-process: monotonic growth and rate — O(n log n) total
@@ -809,9 +803,6 @@ struct UI {
             g.bytes_per_sec  = (span_us > 0)
                                ? (double)g.total_size / ((double)span_us / 1e6)
                                : 0.0;
-            auto fp_it = free_paths_map.find(g.key);
-            g.unique_free_paths = (fp_it != free_paths_map.end())
-                                  ? fp_it->second.size() : 0;
         }
 
         // Sort
@@ -829,18 +820,48 @@ struct UI {
 
         selected = min(selected, max(0, (int)groups.size() - 1));
 
-        // Second pass: compute all_count/all_freed from ALL records (tid-filter only).
-        // This gives accurate totals even when other filters hide some records.
+        // Second pass over ALL records (tid-filter only):
+        // compute all_count, all_freed, not_freed_total, and free_sites.
+        // Using cached keys, this is essentially a hash-map lookup per record — O(n).
         std::unordered_map<string, size_t> idx_map;
+        idx_map.reserve(groups.size() * 2);
         for (size_t i = 0; i < groups.size(); i++) idx_map[groups[i].key] = i;
-        for (size_t i = 0; i < ps->records.size(); i++) {
-            const auto& r = ps->records[i];
+
+        // Per-group accumulator: free_frames_key → {count, frames}
+        struct FSInfo { size_t count = 0; vector<string> frames; };
+        std::unordered_map<string, std::unordered_map<string, FSInfo>> site_acc;
+
+        for (const auto& r : ps->records) {
             if (tid_filter != -1 && r.tid != tid_filter) continue;
-            auto it2 = idx_map.find(group_key(r));
-            if (it2 == idx_map.end()) continue;
-            auto& g = groups[it2->second];
+            const string& key = group_key(r);
+            auto git = idx_map.find(key);
+            if (git == idx_map.end()) continue;
+            auto& g = groups[git->second];
             g.all_count++;
-            if (r.freed && !r.is_leak) g.all_freed++;
+            if (r.freed && !r.is_leak) {
+                g.all_freed++;
+                // Build a key for this free stack (reuse cached alloc-key technique)
+                string fkey;
+                fkey.reserve(r.free_frames.size() * 32);
+                for (const auto& f : r.free_frames) { fkey += f; fkey += '\n'; }
+                auto& si = site_acc[key][fkey];
+                si.count++;
+                if (si.frames.empty()) si.frames = r.free_frames;
+            } else {
+                g.not_freed_total++;
+            }
+        }
+
+        // Finalise free_sites per group (sort desc by count)
+        for (auto& g : groups) {
+            auto sit = site_acc.find(g.key);
+            if (sit == site_acc.end()) { g.unique_free_paths = 0; continue; }
+            g.free_sites.reserve(sit->second.size());
+            for (auto& [fkey, info] : sit->second)
+                g.free_sites.push_back({info.count, std::move(info.frames)});
+            std::sort(g.free_sites.begin(), g.free_sites.end(),
+                      [](const auto& a, const auto& b){ return a.first > b.first; });
+            g.unique_free_paths = g.free_sites.size();
         }
     }
 
@@ -1714,44 +1735,28 @@ static void draw_detail(WINDOW* w, UI& ui)
 
     auto detail  = build_detail(*r, ui.resolve_lines, ui.current_group());
 
-    // In group mode: append aggregated free-site section.
+    // In group mode: append aggregated free-site section (data pre-computed in rebuild_groups).
     if (ui.group_mode && ui.current_group()) {
         const LeakGroup* grp = ui.current_group();
-        // Aggregate unique free stacks from ALL records with this group key
-        // (tid-filter only), so freed instances appear even when filtered out of visible.
-        std::map<vector<string>, size_t> site_count;
-        size_t not_freed = 0;
-        for (size_t i = 0; i < ui.ps->records.size(); i++) {
-            const auto& rec = ui.ps->records[i];
-            if (ui.tid_filter != -1 && rec.tid != ui.tid_filter) continue;
-            if (UI::group_key(rec) != grp->key) continue;
-            if (!rec.freed || rec.is_leak) { not_freed++; continue; }
-            site_count[rec.free_frames]++;
-        }
-        // Sort by count descending.
-        vector<pair<size_t, const vector<string>*>> sorted;
-        for (const auto& [frames, cnt] : site_count)
-            sorted.push_back({cnt, &frames});
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto& a, const auto& b){ return a.first > b.first; });
-
         auto add = [&](string t, int cp = C_NORMAL, int attr = 0){
             detail.push_back({std::move(t), cp, attr});
         };
         add("");
-        add(string("── Free sites (") + std::to_string(sorted.size()) + " unique) ", C_HEADER, A_BOLD);
+        add(string("── Free sites (") + std::to_string(grp->free_sites.size()) + " unique) ",
+            C_HEADER, A_BOLD);
         add("");
-        if (not_freed > 0)
-            add("  NOT FREED: " + std::to_string(not_freed) + " instance(s)", C_LEAK, A_BOLD);
+        if (grp->not_freed_total > 0)
+            add("  NOT FREED: " + std::to_string(grp->not_freed_total) + " instance(s)",
+                C_LEAK, A_BOLD);
         int site_no = 0;
-        for (const auto& [cnt, frames_ptr] : sorted) {
+        for (const auto& [cnt, frames] : grp->free_sites) {
             ++site_no;
             add("  [" + std::to_string(site_no) + "] × " + std::to_string(cnt)
                 + "  ──────────────────────────────", C_FREE, A_BOLD);
-            if (frames_ptr->empty()) {
+            if (frames.empty()) {
                 add("    (no stack captured)", C_DIM, A_DIM);
             } else {
-                add_frames(detail, *frames_ptr, ui.resolve_lines);
+                add_frames(detail, frames, ui.resolve_lines);
             }
             add("");
         }
