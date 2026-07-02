@@ -1083,7 +1083,13 @@ static void draw_histogram(WINDOW* w, const UI& ui)
     bool focused = !ui.focus_detail && !ui.focus_threads;
     int hdr_cp = focused ? C_FOCUS_HDR : C_HEADER;
     wattron(w, COLOR_PAIR(hdr_cp) | A_BOLD);
-    mvwaddstr(w, 0, 0, " [H] Size distribution  (visible records)");
+
+    // In group mode, scope histogram to the selected group's records.
+    const LeakGroup* grp = ui.group_mode ? ui.current_group() : nullptr;
+    if (grp)
+        mvwprintw(w, 0, 0, " [H] Size distribution  — group: ×%zu", grp->count);
+    else
+        mvwaddstr(w, 0, 0, " [H] Size distribution  (visible records)");
     hline_to_eol(w, 0, hdr_cp);
     wattroff(w, COLOR_PAIR(hdr_cp) | A_BOLD);
 
@@ -1108,6 +1114,8 @@ static void draw_histogram(WINDOW* w, const UI& ui)
 
     for (size_t vi : ui.visible) {
         const auto& r = ui.ps->records[vi];
+        // When a group is selected, only include records from that group.
+        if (grp && UI::group_key(r) != grp->key) continue;
         for (int b = 0; b < NBUCKETS; b++) {
             if (r.size <= buckets[b].limit) {
                 count[b]++;
