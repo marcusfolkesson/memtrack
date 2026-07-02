@@ -21,6 +21,7 @@
 #include <locale.h>
 #include <vector>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <algorithm>
 #include <fstream>
@@ -501,6 +502,10 @@ struct LeakGroup {
     uint64_t       min_ts = UINT64_MAX;      // earliest alloc in group
     uint64_t       max_ts = 0;               // latest alloc in group
     double         bytes_per_sec = 0.0;      // allocation rate
+    size_t         unique_free_paths = 0;    // number of distinct free call stacks
+    // Unfiltered totals (computed from all records, tid-filter only)
+    size_t         all_count   = 0;  // total allocations from this site
+    size_t         all_freed   = 0;  // how many were freed (not leaked)
 };
 
 enum FilterMode { F_ALL, F_LEAKS, F_ACTIVE, F_FREED, F_COUNT };
@@ -739,6 +744,8 @@ struct UI {
         std::unordered_map<string, size_t> key_idx;
         // Collect timestamped net-byte events per group in one pass.
         std::unordered_map<string, vector<pair<uint64_t,int64_t>>> events_map;
+        // Unique free call stacks per group (joined frames string → sentinel).
+        std::unordered_map<string, std::unordered_map<string,int>> free_paths_map;
 
         for (size_t vi : visible) {
             const auto& r = ps->records[vi];
@@ -776,8 +783,13 @@ struct UI {
             // Accumulate events for monotonic growth check (alloc + optional free)
             auto& evs = events_map[key];
             evs.push_back({r.timestamp_us, (int64_t)r.size});
-            if (r.freed)
+            if (r.freed) {
                 evs.push_back({r.free_timestamp_us, -(int64_t)r.size});
+                // Track unique free call stacks
+                string fkey;
+                for (const auto& f : r.free_frames) { fkey += f; fkey += '\n'; }
+                free_paths_map[key][fkey] = 1;
+            }
         }
 
         // Post-process: monotonic growth and rate — O(n log n) total
@@ -797,6 +809,9 @@ struct UI {
             g.bytes_per_sec  = (span_us > 0)
                                ? (double)g.total_size / ((double)span_us / 1e6)
                                : 0.0;
+            auto fp_it = free_paths_map.find(g.key);
+            g.unique_free_paths = (fp_it != free_paths_map.end())
+                                  ? fp_it->second.size() : 0;
         }
 
         // Sort
@@ -813,6 +828,20 @@ struct UI {
             });
 
         selected = min(selected, max(0, (int)groups.size() - 1));
+
+        // Second pass: compute all_count/all_freed from ALL records (tid-filter only).
+        // This gives accurate totals even when other filters hide some records.
+        std::unordered_map<string, size_t> idx_map;
+        for (size_t i = 0; i < groups.size(); i++) idx_map[groups[i].key] = i;
+        for (size_t i = 0; i < ps->records.size(); i++) {
+            const auto& r = ps->records[i];
+            if (tid_filter != -1 && r.tid != tid_filter) continue;
+            auto it2 = idx_map.find(group_key(r));
+            if (it2 == idx_map.end()) continue;
+            auto& g = groups[it2->second];
+            g.all_count++;
+            if (r.freed && !r.is_leak) g.all_freed++;
+        }
     }
 
     const AllocRecord* current() const {
@@ -1593,7 +1622,18 @@ static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines,
         sep("Group summary");
         add("");
         add("  Count   : " + std::to_string(grp->count) + " allocations", C_LEAK, A_BOLD);
-        add("  Total   : " + fmt_size(grp->total_size),                    C_LEAK, A_BOLD);
+        if (grp->all_count != grp->count) {
+            // Filter is hiding some records — show full picture
+            size_t leaked = grp->all_count - grp->all_freed;
+            add("  Total   : " + std::to_string(grp->all_count) + " total  ("
+                + std::to_string(grp->all_freed) + " freed, "
+                + std::to_string(leaked) + " leaked)",
+                C_THREAD, 0);
+        }
+        add("  Size    : " + fmt_size(grp->total_size),                    C_LEAK, A_BOLD);
+        if (grp->unique_free_paths > 0)
+            add("  FreePaths: " + std::to_string(grp->unique_free_paths) + " unique free site(s)",
+                grp->unique_free_paths > 1 ? C_FREE : C_NORMAL, 0);
         if (grp->tid != -1)
             add("  Thread  : " + grp->thread_name + " (" + std::to_string(grp->tid) + ")",
                 C_THREAD);
@@ -1633,7 +1673,13 @@ static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines,
             add("  Lifetime: " + fmt_time_ms(r.free_timestamp_us - r.timestamp_us), C_DIM);
         add("  tid     : " + std::to_string(r.free_tid),  C_THREAD);
         add("  Thread  : " + r.free_thread_name,          C_THREAD);
-        if (!r.free_frames.empty()) {
+        // In group mode with multiple free paths, the representative's stack is
+        // arbitrary and misleading — the aggregated "Free sites" section is authoritative.
+        bool multi_paths = grp && grp->unique_free_paths > 1;
+        if (multi_paths) {
+            add("");
+            add("  (multiple free paths — see Free sites below)", C_DIM, A_DIM);
+        } else if (!r.free_frames.empty()) {
             add("");
             add("  Stack:", C_DIM, A_DIM);
             add_frames(d, r.free_frames, resolve_lines);
@@ -1642,7 +1688,7 @@ static vector<DLine> build_detail(const AllocRecord& r, bool resolve_lines,
     return d;
 }
 
-static void draw_detail(WINDOW* w, const UI& ui)
+static void draw_detail(WINDOW* w, UI& ui)
 {
     int rows, cols; getmaxyx(w, rows, cols);
     werase(w);
@@ -1667,11 +1713,56 @@ static void draw_detail(WINDOW* w, const UI& ui)
     }
 
     auto detail  = build_detail(*r, ui.resolve_lines, ui.current_group());
+
+    // In group mode: append aggregated free-site section.
+    if (ui.group_mode && ui.current_group()) {
+        const LeakGroup* grp = ui.current_group();
+        // Aggregate unique free stacks from ALL records with this group key
+        // (tid-filter only), so freed instances appear even when filtered out of visible.
+        std::map<vector<string>, size_t> site_count;
+        size_t not_freed = 0;
+        for (size_t i = 0; i < ui.ps->records.size(); i++) {
+            const auto& rec = ui.ps->records[i];
+            if (ui.tid_filter != -1 && rec.tid != ui.tid_filter) continue;
+            if (UI::group_key(rec) != grp->key) continue;
+            if (!rec.freed || rec.is_leak) { not_freed++; continue; }
+            site_count[rec.free_frames]++;
+        }
+        // Sort by count descending.
+        vector<pair<size_t, const vector<string>*>> sorted;
+        for (const auto& [frames, cnt] : site_count)
+            sorted.push_back({cnt, &frames});
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b){ return a.first > b.first; });
+
+        auto add = [&](string t, int cp = C_NORMAL, int attr = 0){
+            detail.push_back({std::move(t), cp, attr});
+        };
+        add("");
+        add(string("── Free sites (") + std::to_string(sorted.size()) + " unique) ", C_HEADER, A_BOLD);
+        add("");
+        if (not_freed > 0)
+            add("  NOT FREED: " + std::to_string(not_freed) + " instance(s)", C_LEAK, A_BOLD);
+        int site_no = 0;
+        for (const auto& [cnt, frames_ptr] : sorted) {
+            ++site_no;
+            add("  [" + std::to_string(site_no) + "] × " + std::to_string(cnt)
+                + "  ──────────────────────────────", C_FREE, A_BOLD);
+            if (frames_ptr->empty()) {
+                add("    (no stack captured)", C_DIM, A_DIM);
+            } else {
+                add_frames(detail, *frames_ptr, ui.resolve_lines);
+            }
+            add("");
+        }
+    }
+
     int  visible = rows - 2;    // -1 header -1 scrollbar
 
-    // Clamp detail_top (INT_MAX is used as "jump to bottom" sentinel).
+    // Clamp detail_top (INT_MAX is used as "jump to bottom" sentinel) and write back.
     int max_top = max(0, (int)detail.size() - visible);
     int dtop    = min(ui.detail_top, max_top);
+    ui.detail_top = dtop;  // prevent unbounded growth
 
     for (int row = 0; row < visible; row++) {
         int di = dtop + row;
