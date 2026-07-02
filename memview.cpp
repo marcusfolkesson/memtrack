@@ -627,10 +627,16 @@ struct UI {
             if (filter == F_LEAKS  && r.freed && !r.is_leak) continue;
             if (filter == F_ACTIVE && r.freed)               continue;
             if (filter == F_FREED  && !r.freed)              continue;
-            // Lifetime filter: age = time from alloc to "now" (max_ts)
+            // Lifetime filter:
+            // - For freed allocations: actual lifetime = free_ts - alloc_ts
+            // - For live allocations: proxy lifetime = max_ts - alloc_ts
             if (lifetime_min_us > 0) {
-                uint64_t age = (max_ts >= r.timestamp_us) ? (max_ts - r.timestamp_us) : 0;
-                if (age < lifetime_min_us) continue;
+                uint64_t lifetime = r.freed
+                    ? (r.free_timestamp_us >= r.timestamp_us
+                           ? r.free_timestamp_us - r.timestamp_us : 0)
+                    : (max_ts >= r.timestamp_us
+                           ? max_ts - r.timestamp_us : 0);
+                if (lifetime < lifetime_min_us) continue;
             }
             // Delta filter: only show allocations that appeared after the mark point
             if (delta_mode && r.timestamp_us <= mark_ts) continue;
