@@ -949,19 +949,42 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
 
         const auto& recs = ui.ps->records;
         int tid_f = ui.tid_filter;
-        bool any = false;
-        for (const auto& r : recs) if (tid_f == -1 || r.tid == tid_f) { any = true; break; }
 
-        // Resolve thread label (shown left of sparkline when thread is filtered)
-        string tname;
-        int bar_x = 1;   // x-position where the sparkline starts
-        if (tid_f != -1) {
+        // When a group is selected in group mode, scope timeline to that group.
+        const LeakGroup* tl_grp = ui.group_mode ? ui.current_group() : nullptr;
+        const string* grp_key = tl_grp ? &tl_grp->key : nullptr;
+
+        bool any = false;
+        for (const auto& r : recs) {
+            if (tid_f != -1 && r.tid != tid_f) continue;
+            if (grp_key && UI::group_key(r) != *grp_key) continue;
+            any = true; break;
+        }
+
+        // Resolve left label: prefer group description, fall back to thread name.
+        string left_label;
+        int bar_x = 1;
+        if (tl_grp) {
+            // Show first frame (truncated) or op as the label
+            const string& desc = tl_grp->frames.empty() ? tl_grp->op : tl_grp->frames[0];
+            // strip module(sym+off) → just sym, up to 20 chars
+            auto lp = desc.find('('), rp = desc.find(')');
+            string sym = (lp != string::npos && rp > lp)
+                         ? desc.substr(lp + 1, rp - lp - 1) : desc;
+            auto plus = sym.find('+');
+            if (plus != string::npos) sym = sym.substr(0, plus);
+            if (sym.size() > 20) sym = sym.substr(0, 19) + "…";
+            left_label = " [G:" + sym + "] ";
+            bar_x = (int)left_label.size();
+        } else if (tid_f != -1) {
+            string tname;
             for (const auto& t : ui.ps->threads)
                 if (t.tid == tid_f) { tname = t.name; break; }
-            bar_x = 2 + (int)tname.size() + 3;  // " [name] "
+            left_label = " [" + tname + "] ";
+            bar_x = (int)left_label.size();
         }
-        int span_lbl_w = 10;  // reserve space for the right-side duration label
-        int tw = max(1, cols_ - bar_x - span_lbl_w);  // sparkline cell count
+        int span_lbl_w = 10;
+        int tw = max(1, cols_ - bar_x - span_lbl_w);
 
         if (tw > 4 && any) {
             // Always use GLOBAL time range so all thread views share the same x-axis.
@@ -974,10 +997,11 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
             }
             uint64_t span = max<uint64_t>(1, t_max - t_min);
 
-            // Bucket: net live bytes per column cell (filtered by thread if active)
+            // Bucket: net live bytes per column cell (filtered by thread and/or group)
             vector<int64_t> net(tw, 0);
             for (const auto& r : recs) {
                 if (tid_f != -1 && r.tid != tid_f) continue;
+                if (grp_key && UI::group_key(r) != *grp_key) continue;
                 int col = (int)(((r.timestamp_us - t_min) * (uint64_t)tw) / (span + 1));
                 col = max(0, min(tw - 1, col));
                 net[col] += (int64_t)r.size;
@@ -995,10 +1019,11 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
             for (int i = 0; i < tw; i++) { running += net[i]; live[i] = running; peak = max(peak, running); }
 
             // Draw left label
-            if (tid_f != -1) {
-                wattron(w, COLOR_PAIR(C_THREAD));
-                mvwprintw(w, 2, 0, " [%s] ", tname.empty() ? "?" : tname.c_str());
-                wattroff(w, COLOR_PAIR(C_THREAD));
+            if (!left_label.empty()) {
+                int cp = tl_grp ? C_GROUP : C_THREAD;
+                wattron(w, COLOR_PAIR(cp) | A_BOLD);
+                mvwaddstr(w, 2, 0, left_label.c_str());
+                wattroff(w, COLOR_PAIR(cp) | A_BOLD);
             } else {
                 mvwaddstr(w, 2, 0, " ");
             }
