@@ -728,10 +728,17 @@ struct UI {
     }
 
     // Returns the grouping key, computing and caching it on first call.
+    // The key uses module(sym+offset) — the [0xabsoluteaddr] suffix is stripped
+    // so that ASLR or Thumb-bit address differences don't create spurious groups.
     static const string& group_key(const AllocRecord& r) {
         if (r.cached_key.empty()) {
             if (!r.frames.empty()) {
-                for (const auto& f : r.frames) { r.cached_key += f; r.cached_key += '\n'; }
+                for (const auto& f : r.frames) {
+                    // Strip " [0x...]" absolute-address suffix if present.
+                    auto bracket = f.rfind(" [0x");
+                    r.cached_key += (bracket != string::npos) ? f.substr(0, bracket) : f;
+                    r.cached_key += '\n';
+                }
             } else {
                 r.cached_key = "op:" + r.op;
             }
