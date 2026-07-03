@@ -18,6 +18,12 @@
  */
 
 #include <ncurses.h>
+// setcchar/wadd_wch require ncursesw (wide-char ncurses). Detect at compile time.
+#if defined(NCURSES_WIDECHAR) && NCURSES_WIDECHAR
+#  define HAVE_NCURSESW 1
+#else
+#  define HAVE_NCURSESW 0
+#endif
 #include <locale.h>
 #include <vector>
 #include <string>
@@ -1005,7 +1011,12 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
 
     // Row 2: timeline sparkline (toggle with 'Z')
     if (ui.show_timeline) {
+#if HAVE_NCURSESW
         static const wchar_t bars[] = L" ▁▂▃▄▅▆▇█";
+#else
+        // ASCII fallback when ncursesw is unavailable (e.g. narrow-char sysroot)
+        static const char bars[] = " .:!|oO0@";
+#endif
         int height, cols_; getmaxyx(w, height, cols_); (void)height;
 
         const auto& recs = ui.ps->records;
@@ -1131,10 +1142,16 @@ static void draw_header(WINDOW* w, const UI& ui, const string& filename,
 
                 int cp = growing ? C_ALLOC : C_FREE;
                 attr_t extra = in_range ? A_BOLD : A_DIM;
+#if HAVE_NCURSESW
                 cchar_t cc;
                 wchar_t wch[2] = { bars[lvl], 0 };
                 setcchar(&cc, wch, extra, (short)cp, nullptr);
                 wadd_wch(w, &cc);
+#else
+                wattron(w, COLOR_PAIR(cp) | extra);
+                waddch(w, (unsigned char)bars[lvl]);
+                wattroff(w, COLOR_PAIR(cp) | extra);
+#endif
             }
 
             // Overlay persistent markers AFTER sparkline (always visible).
@@ -1499,7 +1516,7 @@ static const string& resolve_addr2line(const string& frame)
         try { raw = stoull(rt_addr, nullptr, 16); } catch (...) { return result; }
         if (raw > 0) {
             char buf[32];
-            snprintf(buf, sizeof(buf), "0x%lx", raw - 1);
+            snprintf(buf, sizeof(buf), "0x%" PRIx64, raw - 1);
             resolve_addr = buf;
         } else {
             return result;  // null pointer — nothing useful to resolve
@@ -1532,7 +1549,7 @@ static const string& resolve_addr2line(const string& frame)
                 char buf[512];
                 while (fgets(buf, sizeof(buf), nfp)) {
                     uint64_t a = 0; char t = 0; char n[256] = {};
-                    if (sscanf(buf, "%lx %c %255s", &a, &t, n) == 3 && a != 0)
+                    if (sscanf(buf, "%" SCNx64 " %c %255s", &a, &t, n) == 3 && a != 0)
                         syms.emplace(n, a);
                 }
                 pclose(nfp);
@@ -1552,7 +1569,7 @@ static const string& resolve_addr2line(const string& frame)
                     // Subtract 1: backtrace gives the return address (instruction after
                     // the call), so -1 puts us inside the CALL instruction itself,
                     // which addr2line maps to the correct calling source line.
-                    snprintf(buf, sizeof(buf), "0x%lx", sit->second + offset - 1);
+                    snprintf(buf, sizeof(buf), "0x%" PRIx64, sit->second + offset - 1);
                     resolve_addr = buf;
                 }
             }
@@ -1872,7 +1889,7 @@ static void draw_threads(WINDOW* w, const UI& ui)
                 wprintw(w, "  [filter: %s]", t.name.c_str());
     }
     if (total > page) {
-        char scroll_info[32];
+        char scroll_info[64];
         snprintf(scroll_info, sizeof(scroll_info), " %d-%d/%d ",
                  top + 1, min(top + page, total), total);
         int si_len = (int)strlen(scroll_info);

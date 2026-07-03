@@ -1,4 +1,5 @@
-CXX      := g++
+CXX      := $(CROSS_TOOLCHAIN)-g++
+HOSTCXX  ?= g++
 CXXFLAGS := -O2 -std=c++17 -Wall -Wextra
 LDFLAGS  := -ldl -lpthread
 
@@ -10,7 +11,7 @@ memtrack.so: memtrack.cpp
 	$(CXX) $(CXXFLAGS) -fPIC -shared -o $@ $< $(LDFLAGS)
 
 memview: memview.cpp
-	$(CXX) $(CXXFLAGS) -o $@ $< -lncurses
+	$(HOSTCXX) $(CXXFLAGS) -o $@ $< -lncurses
 
 test_app: test_app.cpp
 	$(CXX) -O0 -std=c++17 -Wall -Wextra -g -rdynamic -o $@ $< -lpthread
@@ -25,7 +26,6 @@ test: memtrack.so test_app
 	fi
 	@echo "Verifying memtrack log..."
 	@./verify.sh mt.log
-	@echo "All tests passed."
 
 clean:
 	rm -f memtrack.so test_app memview mt.log
