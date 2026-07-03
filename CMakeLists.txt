@@ -19,10 +19,23 @@ target_compile_options(test_app PRIVATE -O0 -g -Wall -Wextra)
 target_link_options(test_app PRIVATE -rdynamic)
 target_link_libraries(test_app PRIVATE pthread)
 
-#Memview
-find_package(Curses REQUIRED)
+#memview ───────────────────────────────────────────────────────────────────
+# Try wide-char ncurses first fall back to narrow.
+set(CURSES_NEED_WIDE TRUE)
+find_package(Curses QUIET)
+if(NOT CURSES_FOUND)
+    set(CURSES_NEED_WIDE FALSE)
+    find_package(Curses REQUIRED)
+endif()
+
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_LIBRARIES ${CURSES_LIBRARIES})
+check_symbol_exists(setcchar "ncurses.h" MEMVIEW_HAVE_NCURSESW)
+unset(CMAKE_REQUIRED_LIBRARIES)
+
 add_executable(memview memview.cpp)
 target_compile_options(memview PRIVATE -Wall -Wextra)
+target_compile_definitions(memview PRIVATE HAVE_NCURSESW=$<BOOL:${MEMVIEW_HAVE_NCURSESW}>)
 target_include_directories(memview PRIVATE ${CURSES_INCLUDE_DIR})
 target_link_libraries(memview PRIVATE ${CURSES_LIBRARIES})
 

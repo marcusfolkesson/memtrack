@@ -18,11 +18,14 @@
  */
 
 #include <ncurses.h>
-// setcchar/wadd_wch require ncursesw (wide-char ncurses). Detect at compile time.
-#if defined(NCURSES_WIDECHAR) && NCURSES_WIDECHAR
-#  define HAVE_NCURSESW 1
-#else
-#  define HAVE_NCURSESW 0
+// HAVE_NCURSESW is injected by CMake based on what the linked library exports.
+// Fallback for builds outside CMake (e.g. manual g++ invocation):
+#ifndef HAVE_NCURSESW
+#  if defined(NCURSES_WIDECHAR) && NCURSES_WIDECHAR
+#    define HAVE_NCURSESW 1
+#  else
+#    define HAVE_NCURSESW 0
+#  endif
 #endif
 #include <locale.h>
 #include <vector>
