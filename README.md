@@ -19,11 +19,34 @@ The library is partly made with Claude Sonnet 4.6.
 
 ## Build
 
+### Requirements
+
+- CMake ≥ 3.16
+- A C++17 compiler
+- ncurses development headers
+
+### Native build (host x86/x64)
+
 ```sh
-make
+cmake -B build
+cmake --build build
 ```
 
-Produces `memtrack.so` and `memview`.
+Produces `build/memtrack.so`, `build/memview`, and `build/test_app`.
+
+### Cross-compile for ARM (or any other target)
+
+Set the `CROSS_TOOLCHAIN` environment variable to the toolchain prefix and pass the provided toolchain file:
+
+```sh
+CROSS_TOOLCHAIN=arm-linux-gnueabihf \
+  cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/arm-linux-toolchain.cmake
+cmake --build build
+```
+
+`memtrack.so`, `memview`, and `test_app` are all built for the target.
+
+Copy `memtrack.so` and `memview` to the target device and run as usual.
 
 ## Usage
 
@@ -280,10 +303,13 @@ A test application (`test_app`) exercises 24 different scenarios across multiple
 Run the suite:
 
 ```sh
-make test
+cmake --build build
+ctest --test-dir build
 ```
 
-This builds all targets, runs the app under `LD_PRELOAD`, captures the log to `mt.log`, and runs `verify.sh` which checks **53 assertions** and reports per-test PASS/FAIL.
+This runs the app under `LD_PRELOAD`, captures the log to `mt.log`, and runs `verify.sh` which checks **53 assertions** and reports per-test PASS/FAIL.
+
+> **Note:** tests require a native build — ARM (cross-compiled) binaries cannot run on the host.
 
 ---
 
