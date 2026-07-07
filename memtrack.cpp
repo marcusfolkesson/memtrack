@@ -107,7 +107,9 @@ static __thread bool   key_set      = false;
 static __thread bool   name_cached  = false;          // separate from thread_name content
 static __thread char   thread_name[16] = {};          // max 15 chars + NUL
 // Per-thread frame-filter result: -1=not yet checked, 0=no frames, 1=capture frames
-static __thread int    frames_enabled = -1;
+static __thread int    frames_enabled  = -1;
+// Per-thread track-filter result: -1=not yet checked, 0=skip, 1=track
+static __thread int    tracking_enabled = -1;
 
 static const char* get_thread_name();  // forward declaration
 static void log_free(void*, const char*); // forward declaration
@@ -128,6 +130,13 @@ static size_t g_buffer_size    = 4096;    // per-thread write buffer (PIPE_BUF);
 static char   g_stack_threads[512]   = {};     // raw copy of the env value
 static char*  g_stack_tnames[64]     = {};     // pointers into g_stack_threads
 static int    g_stack_tname_count    = 0;      // 0 = no filter (all threads)
+
+// Thread-name filter for tracking.  If non-empty, only matching threads have
+// their allocations/frees logged at all.
+// Parsed from MEMTRACK_TRACK_THREADS=name1,name2,...
+static char   g_track_threads[512]   = {};
+static char*  g_track_tnames[64]     = {};
+static int    g_track_tname_count    = 0;      // 0 = no filter (all threads)
 
 // Per-thread output buffer.  Used when g_buffer_size > 0.
 // Allocated lazily with real_malloc to avoid tracking the buffer itself.
@@ -358,6 +367,19 @@ static void __attribute__((constructor)) memtrack_ctor()
             p = comma + 1;
         }
     }
+
+    const char* tthr = getenv("MEMTRACK_TRACK_THREADS");
+    if (tthr && *tthr) {
+        strncpy(g_track_threads, tthr, sizeof(g_track_threads) - 1);
+        char* p = g_track_threads;
+        while (*p && g_track_tname_count < 64) {
+            g_track_tnames[g_track_tname_count++] = p;
+            char* comma = strchr(p, ',');
+            if (!comma) break;
+            *comma = '\0';
+            p = comma + 1;
+        }
+    }
 }
 
 static inline void ensure_exit_hook()
@@ -414,6 +436,30 @@ static bool thread_wants_frames()
         }
     }
     return frames_enabled == 1;
+}
+
+// Returns true if the current thread should have its allocations tracked.
+// Mirrors thread_wants_frames() — cached per-thread, re-checked if name not yet set.
+static bool thread_is_tracked()
+{
+    if (tracking_enabled < 0 || (tracking_enabled == 0 && !name_cached)) {
+        if (g_track_tname_count == 0) {
+            tracking_enabled = 1;  // no filter: track all threads
+        } else {
+            const char* name = get_thread_name();
+            tracking_enabled = 0;
+            if (name[0] != '\0') {
+                for (int i = 0; i < g_track_tname_count; i++) {
+                    if (strstr(name, g_track_tnames[i])) {
+                        tracking_enabled = 1;
+                        break;
+                    }
+                }
+            }
+            if (name[0] == '\0') tracking_enabled = -1;  // retry next call
+        }
+    }
+    return tracking_enabled == 1;
 }
 
 // Write an event line + optional stack frames as a single atomic write().
@@ -475,6 +521,7 @@ static void log_alloc(const char* op, size_t size, void* ptr)
     if (ptr) thread_total += size;
 
     if (!ptr || size < g_min_size) return;
+    if (!thread_is_tracked()) return;
 
     uint64_t ts = elapsed_us();
 

@@ -13,6 +13,7 @@ The library is partly made with Claude Sonnet 4.6.
 - **Cross-thread free after exit** handled correctly — if thread B frees a pointer after the allocating thread has already exited and logged it as a leak, the free is logged and the leak entry is cancelled in memview
 - Optional **stack traces** per allocation/free with automatic C++ symbol demangling
 - Optional **per-thread stack trace filter** (`MEMTRACK_STACK_THREADS`) to capture frames only for threads of interest
+- Optional **per-thread tracking filter** (`MEMTRACK_TRACK_THREADS`) to record allocations only from threads of interest
 - Output to a **file** or stderr
 - **Minimum size filter** to ignore small allocations
 - Companion **ncurses TUI** (`memview`) for interactive browsing
@@ -65,6 +66,7 @@ All output goes to **stderr** by default so it does not interfere with stdout.
 | `MEMTRACK_MIN_SIZE`    | `0`           | Suppress logging for allocations smaller than this many bytes. |
 | `MEMTRACK_STACK_DEPTH`   | `0`           | Number of call-stack frames to capture per allocation/free (0 = disabled). Compile with `-rdynamic` for resolved symbol names. |
 | `MEMTRACK_STACK_THREADS` | *(all)*       | Comma-separated list of thread-name substrings. When set, only threads whose name contains one of the substrings capture stack frames. Example: `MEMTRACK_STACK_THREADS=Remote,Worker`. Requires `MEMTRACK_STACK_DEPTH > 0`. |
+| `MEMTRACK_TRACK_THREADS` | *(all)*       | Comma-separated list of thread-name substrings. When set, only allocations/frees from matching threads are logged. All other threads are completely invisible to memview. Example: `MEMTRACK_TRACK_THREADS=Worker,IO`. |
 | `MEMTRACK_BUFFER_SIZE`   | `4096`        | Per-thread output buffer size. Accepts a plain byte count or a `K`/`M` suffix, e.g. `64K` or `1M`. Set to `0` to disable buffering (one `write()` per event). |
 
 
